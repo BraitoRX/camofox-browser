@@ -88,8 +88,21 @@ afterEach(() => {
 
 // --- Schema sanity ----------------------------------------------------------
 describe('TOOL_DEFS', () => {
-  test('exposes exactly 11 tools', () => {
+  test('exposes exactly 11 tools in stable order', () => {
     expect(TOOL_DEFS).toHaveLength(11);
+    expect(TOOL_NAMES).toEqual([
+      'camofox_create_tab',
+      'camofox_snapshot',
+      'camofox_click',
+      'camofox_type',
+      'camofox_navigate',
+      'camofox_scroll',
+      'camofox_screenshot',
+      'camofox_close_tab',
+      'camofox_evaluate',
+      'camofox_list_tabs',
+      'camofox_import_cookies',
+    ]);
   });
 
   test('every def has a unique name and a valid JSON-Schema object', () => {
@@ -99,6 +112,17 @@ describe('TOOL_DEFS', () => {
       expect(t.inputSchema.type).toBe('object');
       expect(Array.isArray(t.inputSchema.required)).toBe(true);
     }
+  });
+
+  test('camofox_click schema exposes strict coordinates, doubleClick, includeScreenshot', () => {
+    const click = TOOL_DEFS.find((t) => t.name === 'camofox_click');
+    const coordinates = click.inputSchema.properties.coordinates;
+    expect(coordinates.type).toBe('object');
+    expect(coordinates.required).toEqual(['x', 'y', 'captureId']);
+    expect(coordinates.additionalProperties).toBe(false);
+    expect(Object.keys(coordinates.properties).sort()).toEqual(['captureId', 'x', 'y']);
+    expect(click.inputSchema.properties.doubleClick.type).toBe('boolean');
+    expect(click.inputSchema.properties.includeScreenshot.type).toBe('boolean');
   });
 });
 
@@ -138,6 +162,42 @@ describe('buildRequest', () => {
   test('evaluate body is exactly { userId, expression }', () => {
     const spec = buildRequest('camofox_evaluate', { tabId: 't1', expression: 'document.title' }, CTX);
     expect(spec.body).toEqual({ userId: 'u1', expression: 'document.title' });
+  });
+
+  test('coordinate click forwards nested coordinates + strict booleans without tabId', () => {
+    const spec = buildRequest('camofox_click', {
+      tabId: 't1',
+      coordinates: { x: 12.5, y: 34, captureId: 'cap-1' },
+      doubleClick: true,
+      includeScreenshot: true,
+    }, CTX);
+    expect(spec.method).toBe('POST');
+    expect(spec.path).toBe('/tabs/t1/click');
+    expect(spec.body).toEqual({
+      coordinates: { x: 12.5, y: 34, captureId: 'cap-1' },
+      doubleClick: true,
+      includeScreenshot: true,
+      userId: 'u1',
+    });
+    expect(spec.body.tabId).toBeUndefined();
+    expect(spec.responseKind).toBe('snapshot');
+  });
+
+  test('legacy ref click keeps the json responseKind and body', () => {
+    const spec = buildRequest('camofox_click', { tabId: 't1', ref: 'e1' }, CTX);
+    expect(spec.responseKind).toBe('json');
+    expect(spec.body).toEqual({ ref: 'e1', userId: 'u1' });
+  });
+
+  test('includeScreenshot must be strictly true to select the snapshot adapter', () => {
+    for (const includeScreenshot of [false, 'true', 1, undefined]) {
+      const spec = buildRequest('camofox_click', {
+        tabId: 't1',
+        coordinates: { x: 1, y: 2, captureId: 'cap-1' },
+        includeScreenshot,
+      }, CTX);
+      expect(spec.responseKind).toBe('json');
+    }
   });
 
   test('import_cookies is NOT synchronous (must use buildCookieRequest)', () => {
@@ -194,6 +254,18 @@ describe('adaptResponse', () => {
     const block = { type: 'image', data: 'IMG', mimeType: 'image/png' };
     expect(adaptResponse({ responseKind: 'image' }, block)).toEqual([block]);
   });
+  test('image with visualCapture → compact metadata text first, unchanged image second', () => {
+    const block = { type: 'image', data: 'IMG', mimeType: 'image/png' };
+    const visualCapture = { captureId: 'c1', imageWidth: 100, imageHeight: 50 };
+    const content = adaptResponse({ responseKind: 'image' }, { image: block, visualCapture });
+    expect(content).toHaveLength(2);
+    expect(content[0]).toEqual({ type: 'text', text: JSON.stringify({ visualCapture }) });
+    expect(content[1]).toBe(block);
+  });
+  test('image payload without visualCapture stays a single image block', () => {
+    const block = { type: 'image', data: 'IMG', mimeType: 'image/png' };
+    expect(adaptResponse({ responseKind: 'image' }, { image: block })).toEqual([block]);
+  });
   test('cookie import → surfaces imported count', () => {
     const spec = { responseKind: 'json', meta: { imported: 3, userId: 'u1' } };
     const c = adaptResponse(spec, { ok: true });
@@ -234,6 +306,47 @@ describe('fetchSpec (mock REST)', () => {
     const out = await fetchSpec(BASE, buildRequest('camofox_screenshot', { tabId: 't1' }, CTX), cfg());
     expect(out).toMatchObject({ type: 'image', mimeType: 'image/png' });
     expect(out.data).toBe(pngBytes.toString('base64'));
+    expect(out.visualCapture).toBeUndefined();
+  });
+
+  test('screenshot decodes base64url visual metadata into { image, visualCapture }', async () => {
+    const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+    const visualCapture = {
+      captureId: 'cap-1',
+      imageWidth: 2,
+      imageHeight: 3,
+      viewportWidth: 1,
+      viewportHeight: 1.5,
+      devicePixelRatio: 2,
+      scrollX: 0,
+      scrollY: 0,
+      url: 'https://example.test/',
+      capturedAt: 1234567890,
+    };
+    const header = Buffer.from(JSON.stringify(visualCapture), 'utf8').toString('base64url');
+    installFetch([
+      {
+        match: (r) => r.method === 'GET' && r.path === '/tabs/t1/screenshot?userId=u1',
+        respond: () => ({ headers: { 'content-type': 'image/png', 'x-camofox-visual-metadata': header }, buffer: pngBytes }),
+      },
+    ]);
+    const out = await fetchSpec(BASE, buildRequest('camofox_screenshot', { tabId: 't1' }, CTX), cfg());
+    expect(out.image).toEqual({ type: 'image', data: pngBytes.toString('base64'), mimeType: 'image/png' });
+    expect(out.visualCapture).toEqual(visualCapture);
+  });
+
+  test('malformed visual metadata header does not fail the screenshot', async () => {
+    const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+    const header = Buffer.from('{not json', 'utf8').toString('base64url');
+    installFetch([
+      {
+        match: (r) => r.method === 'GET' && r.path === '/tabs/t1/screenshot?userId=u1',
+        respond: () => ({ headers: { 'content-type': 'image/png', 'x-camofox-visual-metadata': header }, buffer: pngBytes }),
+      },
+    ]);
+    const out = await fetchSpec(BASE, buildRequest('camofox_screenshot', { tabId: 't1' }, CTX), cfg());
+    expect(out).toEqual({ type: 'image', data: pngBytes.toString('base64'), mimeType: 'image/png' });
+    expect(out.visualCapture).toBeUndefined();
   });
 
   test('screenshot that returns JSON (error with 200) is not base64-encoded', async () => {
@@ -262,6 +375,46 @@ describe('runTool (end-to-end)', () => {
     const content = adaptResponse(spec, payload);
     expect(content).toHaveLength(2);
     expect(content[1]).toMatchObject({ type: 'image', data: 'IMG' });
+  });
+
+  test('coordinate click with includeScreenshot sends coordinates and splits the post-click image', async () => {
+    let seen;
+    installFetch([
+      {
+        match: (r) => r.method === 'POST' && r.path === '/tabs/t1/click',
+        respond: (r) => {
+          seen = r;
+          return {
+            body: {
+              ok: true,
+              url: 'https://example.test/click',
+              refsAvailable: false,
+              screenshot: { data: 'IMG', mimeType: 'image/png' },
+              visualCapture: { captureId: 'cap-2' },
+            },
+          };
+        },
+      },
+    ]);
+    const { spec, payload } = await runTool(
+      'camofox_click',
+      { tabId: 't1', coordinates: { x: 7, y: 8, captureId: 'cap-1' }, includeScreenshot: true },
+      CTX,
+      BASE,
+      cfg()
+    );
+    expect(spec.responseKind).toBe('snapshot');
+    expect(JSON.parse(seen.body)).toEqual({
+      coordinates: { x: 7, y: 8, captureId: 'cap-1' },
+      includeScreenshot: true,
+      userId: 'u1',
+    });
+    const content = adaptResponse(spec, payload);
+    expect(content).toHaveLength(2);
+    expect(content[0].type).toBe('text');
+    expect(JSON.parse(content[0].text)).toMatchObject({ ok: true, refsAvailable: false, visualCapture: { captureId: 'cap-2' } });
+    expect(content[0].text).not.toContain('IMG');
+    expect(content[1]).toEqual({ type: 'image', data: 'IMG', mimeType: 'image/png' });
   });
 });
 

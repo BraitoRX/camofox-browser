@@ -57,6 +57,12 @@ import {
   isTabLockQueueTimeout, isTabDestroyedError,
   browserErrorStatus, browserErrorCode, browserErrorRecovery, isRetryableBrowserError,
 } from './lib/browser-errors.js';
+import {
+  bindVisualCaptureInvalidation,
+  invalidCoordinatesError,
+  captureVisualState,
+  resolveCoordinatesToCss,
+} from './lib/visual-capture.js';
 
 const CONFIG = loadConfig();
 
@@ -1779,8 +1785,12 @@ function createTabState(page) {
     pressureObservedAt: Date.now(),
     pressureObservedToolCalls: 0,
     crashed: false,
+    // Latest screenshot-coordinate capture metadata for this tab (see
+    // lib/visual-capture.js); null when no capture is valid for coordinate clicks.
+    visualCapture: null,
   };
   page?.on?.('crash', () => { tabState.crashed = true; });
+  bindVisualCaptureInvalidation(tabState, page);
   return tabState;
 }
 
@@ -3103,6 +3113,9 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
       const resolvedSessionKey = sessionKey || listItemId || found.listItemId || 'default';
       let tabState = found.tabState;
       tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+      // Navigation invalidates any screenshot capture; explicit here in addition
+      // to the main-frame navigation listener.
+      tabState.visualCapture = null;
       
       let targetUrl = url;
       if (macro && macro !== '__NO__' && macro !== 'none' && macro !== 'null') {
@@ -3539,6 +3552,9 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
     
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+    // Switching to snapshot/DOM-ref observation invalidates coordinate pixels:
+    // its bundled image (if any) is not a viewport coordinate capture.
+    tabState.visualCapture = null;
 
     // Cached chunk retrieval for offset>0 requests
     if (offset > 0 && tabState.lastSnapshot) {
@@ -3568,6 +3584,11 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
             tabState.lastSnapshot = rotated.tabState.lastSnapshot;
             tabState.lastRequestedUrl = rotated.tabState.lastRequestedUrl;
             tabState.googleRetryCount = rotated.tabState.googleRetryCount;
+            // The replacement page cannot reuse a capture from the old page, and
+            // the surviving tabState must watch the new page for main-frame
+            // navigations (the old listener is page-identity guarded).
+            tabState.visualCapture = null;
+            bindVisualCaptureInvalidation(tabState, tabState.page);
           }
         }
       }
@@ -3736,8 +3757,13 @@ app.post('/tabs/:tabId/wait', async (req, res) => {
  * /tabs/{tabId}/click:
  *   post:
  *     tags: [Interaction]
- *     summary: Click an element
- *     description: Click by element ref, CSS selector, or coordinates.
+ *     summary: Click an element or screenshot coordinate
+ *     description: >
+ *       Click by element ref, CSS selector, or image-pixel coordinates from the
+ *       latest viewport screenshot. Coordinates must carry the captureId from
+ *       that screenshot's visualCapture metadata and are mapped proportionally
+ *       onto the CSS viewport. Stale or mismatched captures are rejected with
+ *       409 stale_visual_capture; coordinates cannot be combined with ref/selector.
  *     parameters:
  *       - name: tabId
  *         in: path
@@ -3762,22 +3788,37 @@ app.post('/tabs/:tabId/wait', async (req, res) => {
  *                 description: CSS selector fallback.
  *               doubleClick:
  *                 type: boolean
+ *                 description: Double-click (only used with coordinates).
+ *               includeScreenshot:
+ *                 type: boolean
+ *                 description: >
+ *                   Return a post-click viewport screenshot plus visualCapture
+ *                   metadata instead of rebuilding element refs
+ *                   (refsAvailable=false).
  *               coordinates:
  *                 type: object
+ *                 description: >
+ *                   Image-pixel coordinates in the latest standalone screenshot
+ *                   (its visualCapture.captureId). Mutually exclusive with
+ *                   ref/selector.
+ *                 required: [x, y, captureId]
  *                 properties:
  *                   x:
  *                     type: number
  *                   y:
  *                     type: number
+ *                   captureId:
+ *                     type: string
+ *                 additionalProperties: false
  *     responses:
  *       200:
- *         description: Click result with optional post-action snapshot.
+ *         description: Click result with optional post-action screenshot and visualCapture metadata.
  *         content:
  *           application/json:
  *             schema:
  *               type: object
  *       400:
- *         description: Bad request.
+ *         description: Bad request (invalid_coordinates for malformed or out-of-range coordinates).
  *         content:
  *           application/json:
  *             schema:
@@ -3789,7 +3830,7 @@ app.post('/tabs/:tabId/wait', async (req, res) => {
  *             schema:
  *               $ref: '#/components/schemas/Error'
  *       409:
- *         description: Page changed during the click; caller should take a fresh snapshot and retry with current refs.
+ *         description: Page changed or visual capture is stale; retry with a fresh screenshot/snapshot.
  *         content:
  *           application/json:
  *             schema:
@@ -3799,7 +3840,9 @@ app.post('/tabs/:tabId/click', async (req, res) => {
   const tabId = req.params.tabId;
   
   try {
-    const { userId, ref, selector } = req.body;
+    const { userId, ref, selector, coordinates } = req.body;
+    const doubleClick = req.body.doubleClick === true;
+    const includeScreenshot = req.body.includeScreenshot === true;
     if (!userId) return res.status(400).json({ error: 'userId required' });
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, tabId);
@@ -3809,12 +3852,17 @@ app.post('/tabs/:tabId/click', async (req, res) => {
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     
-    if (!ref && !selector) {
-      return res.status(400).json({ error: 'ref or selector required' });
+    const hasCoordinates = coordinates !== undefined && coordinates !== null;
+    if (hasCoordinates && (ref || selector)) {
+      throw invalidCoordinatesError('coordinates cannot be combined with ref or selector');
+    }
+    if (!ref && !selector && !hasCoordinates) {
+      return res.status(400).json({ error: 'ref, selector, or coordinates required' });
     }
     const selectorErr = selectorValidationError(selector);
     if (selectorErr) throw invalidSelectorError(selectorErr);
     
+    let coordinateClickPoint = null;
     const result = await withUserLimit(userId, () => withTabLock(tabId, async () => {
       const clickStart = Date.now();
       const remainingBudget = () => Math.max(0, HANDLER_TIMEOUT_MS - 2000 - (Date.now() - clickStart));
@@ -3909,7 +3957,19 @@ app.post('/tabs/:tabId/click', async (req, res) => {
         }
       };
       
-      if (ref) {
+      if (hasCoordinates) {
+        const { cssX, cssY } = await resolveCoordinatesToCss(tabState, coordinates);
+        coordinateClickPoint = { x: Number(cssX.toFixed(1)), y: Number(cssY.toFixed(1)) };
+        // Invalidate immediately before dispatch: a partial or timed-out click
+        // must not leave this capture reusable.
+        tabState.visualCapture = null;
+        log('info', 'coordinate click', { reqId: req.reqId, tabId, x: cssX.toFixed(0), y: cssY.toFixed(0), doubleClick });
+        await clickWithDownloadGuard(tabState, () => withTimeout(
+          tabState.page.mouse.click(cssX, cssY, { clickCount: doubleClick ? 2 : 1 }),
+          Math.max(1, remainingBudget()),
+          'native coordinate click',
+        ));
+      } else if (ref) {
         let locator = refToLocator(tabState.page, ref, tabState.refs);
         if (!locator) {
           // Use tight timeout (4s max) to leave budget for click + post-click buildRefs
@@ -3930,10 +3990,29 @@ app.post('/tabs/:tabId/click', async (req, res) => {
           const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none';
           throw new StaleRefsError(ref, maxRef, tabState.refs.size);
         }
+        // Invalidate immediately before dispatch (see the coordinate branch above).
+        tabState.visualCapture = null;
         await doClick(locator, true);
       } else {
+        // Invalidate immediately before dispatch (see the coordinate branch above).
+        tabState.visualCapture = null;
         await doClick(selector, false);
       }
+      
+      // Attach the post-click viewport screenshot + fresh visualCapture when the
+      // caller asked for it. A capture failure must not fail the completed click.
+      const attachPostClickScreenshot = async (clickResult) => {
+        if (!includeScreenshot) return clickResult;
+        try {
+          const { buffer, visualCapture } = await captureVisualState(tabState);
+          clickResult.screenshot = { data: buffer.toString('base64'), mimeType: 'image/png' };
+          clickResult.visualCapture = visualCapture;
+        } catch (screenshotErr) {
+          log('warn', 'post-click screenshot failed', { reqId: req.reqId, tabId, error: screenshotErr.message });
+          clickResult.screenshotError = `Post-click screenshot failed: ${safeError(screenshotErr)}`;
+        }
+        return clickResult;
+      };
       
       // If clicking on a Google SERP, wait for potential navigation to complete
       if (onGoogleSerp) {
@@ -3947,11 +4026,23 @@ app.post('/tabs/:tabId/click', async (req, res) => {
         tabState.refs = new Map();
         const newUrl = tabState.page.url();
         tabState.visitedUrls.add(newUrl);
-        return { ok: true, url: newUrl, refsAvailable: false };
+        return attachPostClickScreenshot({ ok: true, url: newUrl, refsAvailable: false });
       } else {
         await tabState.page.waitForTimeout(500);
       }
       tabState.lastSnapshot = null;
+
+      // Coordinate clicks and includeScreenshot callers do not need the
+      // expensive accessibility rebuild; their next observation is the image.
+      // Clear refs so a later ref-based action rebuilds instead of consuming
+      // refs that may predate the click.
+      if (hasCoordinates || includeScreenshot) {
+        tabState.refs = new Map();
+        const newUrl = tabState.page.url();
+        tabState.visitedUrls.add(newUrl);
+        return attachPostClickScreenshot({ ok: true, url: newUrl, refsAvailable: false });
+      }
+
       // buildRefs after click -- use remaining budget (min 2s) so we don't blow the handler timeout.
       // If it times out, return without refs (caller's next /snapshot will rebuild them).
       const postClickBudget = Math.max(2000, remainingBudget());
@@ -3972,7 +4063,13 @@ app.post('/tabs/:tabId/click', async (req, res) => {
     }, HANDLER_TIMEOUT_MS, () => destroyTimedOutTab(session, tabId, 'operation_timeout', userId)));
     
     log('info', 'clicked', { reqId: req.reqId, tabId, url: result.url });
-    pluginEvents.emit('tab:click', { userId: req.body.userId, tabId, ref: req.body.ref, selector: req.body.selector });
+    pluginEvents.emit('tab:click', {
+      userId: req.body.userId,
+      tabId,
+      ref: req.body.ref,
+      selector: req.body.selector,
+      ...(coordinateClickPoint ? { coordinates: coordinateClickPoint } : {}),
+    });
     res.json(result);
   } catch (err) {
     log('error', 'click failed', { reqId: req.reqId, tabId, error: err.message });
@@ -4294,6 +4391,8 @@ app.post('/tabs/:tabId/type', async (req, res) => {
     
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+    // Typing can reflow the page; a pre-typing capture must not be reused.
+    tabState.visualCapture = null;
     
     if (mode !== 'fill' && mode !== 'keyboard') {
       return res.status(400).json({ error: "mode must be 'fill' or 'keyboard'" });
@@ -4581,6 +4680,9 @@ app.post('/tabs/:tabId/scroll', async (req, res) => {
     
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+    // Scrolling invalidates any screenshot capture (its scroll offset no longer
+    // matches the live viewport).
+    tabState.visualCapture = null;
     
     await withTabLock(req.params.tabId, async () => {
       const isVertical = direction === 'up' || direction === 'down';
@@ -4668,6 +4770,9 @@ app.post('/tabs/:tabId/viewport', async (req, res) => {
 
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+    // A viewport resize invalidates any screenshot capture (image pixels map to
+    // a different CSS viewport now).
+    tabState.visualCapture = null;
 
     await tabState.page.setViewportSize({ width: Math.round(width), height: Math.round(height) });
     await tabState.page.waitForTimeout(150);
@@ -5135,7 +5240,12 @@ app.get('/tabs/:tabId/images', async (req, res) => {
  *   get:
  *     tags: [Content]
  *     summary: Take a screenshot
- *     description: Returns a base64-encoded PNG screenshot.
+ *     description: >
+ *       Returns a raw PNG. By default the screenshot is viewport-only and the
+ *       response carries an X-Camofox-Visual-Metadata header (base64url-encoded
+ *       UTF-8 JSON) with the visualCapture metadata used by coordinate clicks.
+ *       fullPage=true returns the legacy full-page PNG without metadata and
+ *       invalidates any existing viewport capture.
  *     parameters:
  *       - name: tabId
  *         in: path
@@ -5147,21 +5257,25 @@ app.get('/tabs/:tabId/images', async (req, res) => {
  *         required: true
  *         schema:
  *           type: string
+ *       - name: fullPage
+ *         in: query
+ *         required: false
+ *         schema:
+ *           type: boolean
+ *         description: Return a full-page PNG instead of a viewport capture; no visualCapture metadata is produced.
  *     responses:
  *       200:
- *         description: Screenshot.
- *         content:
- *           application/json:
+ *         description: Raw PNG screenshot. Viewport captures include the X-Camofox-Visual-Metadata header; fullPage=true does not.
+ *         headers:
+ *           X-Camofox-Visual-Metadata:
+ *             description: base64url-encoded UTF-8 JSON visualCapture metadata for viewport captures.
  *             schema:
- *               type: object
- *               properties:
- *                 screenshot:
- *                   type: object
- *                   properties:
- *                     data:
- *                       type: string
- *                     mimeType:
- *                       type: string
+ *               type: string
+ *         content:
+ *           image/png:
+ *             schema:
+ *               type: string
+ *               format: binary
  *       404:
  *         description: Tab not found.
  *         content:
@@ -5179,9 +5293,25 @@ app.get('/tabs/:tabId/screenshot', async (req, res) => {
     session.lastAccess = Date.now();
     
     const { tabState } = found;
-    const buffer = await tabState.page.screenshot({ type: 'png', fullPage });
+    if (fullPage) {
+      // Full-page screenshots are not valid coordinate captures (image pixels do
+      // not map to the viewport); invalidate any older viewport capture and keep
+      // the legacy raw-PNG response for them. Run under the tab lock so a
+      // full-page shot cannot overlap a coordinate click or viewport capture.
+      const buffer = await withTabLock(req.params.tabId, async () => {
+        tabState.visualCapture = null;
+        return tabState.page.screenshot({ type: 'png', fullPage: true });
+      });
+      pluginEvents.emit('tab:screenshot', { userId, tabId: req.params.tabId, buffer });
+      res.set('Content-Type', 'image/png');
+      return res.send(buffer);
+    }
+    // Serialize the capture with the per-tab lock; the stored capture is the only
+    // one coordinate clicks may reference.
+    const { buffer, visualCapture } = await withTabLock(req.params.tabId, () => captureVisualState(tabState));
     pluginEvents.emit('tab:screenshot', { userId, tabId: req.params.tabId, buffer });
     res.set('Content-Type', 'image/png');
+    res.set('X-Camofox-Visual-Metadata', Buffer.from(JSON.stringify(visualCapture), 'utf8').toString('base64url'));
     res.send(buffer);
   } catch (err) {
     log('error', 'screenshot failed', { reqId: req.reqId, error: err.message });
@@ -6721,6 +6851,13 @@ app.post('/act', async (req, res) => {
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     
     const result = await withTabLock(targetId, async () => {
+      // Legacy /act input actions share this tab's state with the coordinate
+      // routes; invalidate any screenshot capture before they can mutate the
+      // rendered page (wait is read-only; close removes the tab).
+      if (kind === 'click' || kind === 'type' || kind === 'press' ||
+          kind === 'scroll' || kind === 'scrollIntoView' || kind === 'hover') {
+        tabState.visualCapture = null;
+      }
       switch (kind) {
         case 'click': {
           const { ref, selector, doubleClick } = params;

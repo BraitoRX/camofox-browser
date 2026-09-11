@@ -179,10 +179,10 @@ You should see 11 tools: `camofox_create_tab`, `camofox_snapshot`, `camofox_clic
 | `camofox_create_tab` | Open a URL → returns `tabId` |
 | `camofox_snapshot` | Accessibility snapshot + element refs (`e1`, `e2`, ...) + screenshot |
 | `camofox_navigate` | Go to a URL **or** use a search macro (`@google_search`, `@reddit_search`, ...) |
-| `camofox_click` | Click by element ref (`e1`) or CSS selector |
+| `camofox_click` | Click by element ref (`e1`), CSS selector, or screenshot coordinates `{x, y, captureId}` |
 | `camofox_type` | Type text into a ref/selector, optional `pressEnter` |
 | `camofox_scroll` | Scroll by pixels (unreliable on lazy-load pages — prefer `camofox_evaluate`) |
-| `camofox_screenshot` | Standalone screenshot |
+| `camofox_screenshot` | Viewport screenshot + `visualCapture` metadata (`captureId`) for coordinate clicks |
 | `camofox_evaluate` | Run JS in page context — extract data, call page APIs, scroll via `window.scrollTo` |
 | `camofox_list_tabs` | List open tabs in this session |
 | `camofox_close_tab` | Close a tab |
@@ -190,7 +190,17 @@ You should see 11 tools: `camofox_create_tab`, `camofox_snapshot`, `camofox_clic
 
 ## Workflow
 
-Every interaction follows the same shape — **snapshot before you act**:
+Two observation paths, same REST server.
+
+**Visual targeting (screenshot-first)** — when you can inspect page images:
+
+1. `create_tab({ url })` → `tabId`
+2. `screenshot({ tabId })` → PNG + a `visualCapture` text block (`captureId`, image/viewport dimensions, DPR, scroll, url, `capturedAt`)
+3. `click({ tabId, coordinates: { x, y, captureId } })` → `x`/`y` are pixels in that PNG image, **not** CSS pixels; the server maps them onto the live CSS viewport
+4. Optional: pass `includeScreenshot: true` on the click to get the next viewport screenshot + fresh `visualCapture` back (`refsAvailable=false`), then click again with the new `captureId`
+5. `close_tab` when done
+
+**Element targeting (refs)** — the fallback, and the only path for typing:
 
 1. `create_tab({ url })` → `tabId`
 2. `snapshot({ tabId })` → element refs (`e1`, `e2`, ...)
@@ -198,7 +208,9 @@ Every interaction follows the same shape — **snapshot before you act**:
 4. `snapshot` again to read the new state
 5. `close_tab` when done
 
-Element refs are unambiguous and preferred over CSS selectors — a selector that matches multiple elements returns `422 strict mode violation`, in which case re-snapshot and click by ref.
+Captures expire after 120 seconds. Navigation, snapshot, typing, scrolling, viewport changes, clicks, and newer captures all invalidate one — if a click returns `409 stale_visual_capture`, take a fresh screenshot and retry with its new `captureId`. `400 invalid_coordinates` means the request was malformed (missing/non-finite `x`/`y`, missing `captureId`, or a point outside the image), and `coordinates` cannot be combined with `ref`/`selector` (`doubleClick` applies to coordinates only).
+
+Prefer element refs when the target is ambiguous or moving, when it sits in an iframe and the click point is unclear, or when the page may change between screenshot and click — a capture only guarantees the URL/viewport/DPR/scroll match, not that the DOM stayed still. If your host can't display images, stay on `snapshot` + refs. Element refs are unambiguous and preferred over CSS selectors — a selector that matches multiple elements returns `422 strict mode violation`, in which case re-snapshot and click by ref.
 
 ## Environment variables
 
@@ -215,6 +227,8 @@ Element refs are unambiguous and preferred over CSS selectors — a selector tha
 - **`503 session_expired` / `tab create timed out`** — the REST server's browser session died (often after a prior failed call destabilized it). Restart `npm start`.
 - **`camofox_scroll` returns `{ok:true}` but the page doesn't move** — expected on lazy-load / virtual-scroll pages; the server's `mouse.wheel` no-ops there. Use `camofox_evaluate` with `window.scrollTo` / `scrollBy`.
 - **`422 strict mode violation ... resolved to N elements`** on `click` — CSS selector matched multiple elements. Re-snapshot and click by element ref.
+- **`409 stale_visual_capture` on `camofox_click`** — the screenshot capture is missing, expired (>120s), or the page changed (URL/viewport/DPR/scroll) since it was taken. Run `camofox_screenshot` again and retry with the new `visualCapture.captureId`.
+- **`400 invalid_coordinates` on `camofox_click`** — malformed coordinates (`x`/`y` must be finite numbers, `captureId` required) or the point lies outside the captured image. `coordinates` cannot be combined with `ref`/`selector`.
 - **`403 Forbidden` on `camofox_import_cookies`** — key mismatch between REST server and MCP server, or hitting a remote server without `CAMOFOX_API_KEY`.
 - **`401`/`403` on every tool call, not just cookie import** — the REST server has `CAMOFOX_ACCESS_KEY` set. Set the same `CAMOFOX_ACCESS_KEY` in the MCP server's env (see table above) — it's forwarded automatically as `Authorization: Bearer` once set.
 

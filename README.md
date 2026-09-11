@@ -47,6 +47,7 @@ This project wraps that engine in a REST API built for agents: accessibility sna
 
 - **C++ Anti-Detection** - bypasses Google, Cloudflare, and most bot detection
 - **Element Refs** - stable `e1`, `e2`, `e3` identifiers for reliable interaction
+- **Screenshot Coordinate Navigation** - click by image pixels from a viewport screenshot; the capture's `captureId` maps pixels onto the live viewport, with element refs as the fallback
 - **Token-Efficient** - accessibility snapshots are ~90% smaller than raw HTML
 - **Runs on Anything** - lazy browser launch + idle shutdown keeps memory at ~40MB when idle. Designed to share a box with the rest of your stack -- Raspberry Pi, $5 VPS, shared infra.
 - **Session Isolation** - separate cookies/storage per user
@@ -531,6 +532,21 @@ curl -X POST http://localhost:9377/tabs/TAB_ID/click \
   -H 'Content-Type: application/json' \
   -d '{"userId": "agent1", "ref": "e1"}'
 
+# Screenshot-first: capture the viewport and read its visualCapture metadata
+# from the X-Camofox-Visual-Metadata response header (base64url JSON).
+curl -sD /tmp/camofox-headers.txt \
+  "http://localhost:9377/tabs/TAB_ID/screenshot?userId=agent1" -o /tmp/camofox.png
+
+# Click an image pixel (x/y are pixels in camofox.png, not CSS pixels).
+# includeScreenshot:true returns the next viewport screenshot + fresh visualCapture.
+curl -X POST http://localhost:9377/tabs/TAB_ID/click \
+  -H 'Content-Type: application/json' \
+  -d '{"userId": "agent1", "coordinates": {"x": 412, "y": 268, "captureId": "CAPTURE_ID"}, "includeScreenshot": true}'
+# -> { "ok": true, "url": "...", "refsAvailable": false, "screenshot": {...}, "visualCapture": {...} }
+
+# Refs remain the fallback for typing, ambiguous/moving targets, or when you
+# can't inspect images -- get refs from /snapshot and click/type with those.
+
 # Type into an element
 curl -X POST http://localhost:9377/tabs/TAB_ID/type \
   -H 'Content-Type: application/json' \
@@ -560,7 +576,7 @@ curl -X POST http://localhost:9377/tabs/TAB_ID/navigate \
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/tabs/:id/snapshot` | Accessibility snapshot with element refs. Query params: `includeScreenshot=true` (add base64 PNG), `offset=N` (paginate large snapshots) |
-| `POST` | `/tabs/:id/click` | Click element by ref or CSS selector |
+| `POST` | `/tabs/:id/click` | Click by ref, CSS selector, or screenshot `coordinates` `{x, y, captureId}`; `includeScreenshot=true` returns the next viewport screenshot + fresh `visualCapture` |
 | `POST` | `/tabs/:id/type` | Type text into element |
 | `POST` | `/tabs/:id/press` | Press a keyboard key |
 | `POST` | `/tabs/:id/scroll` | Scroll page (up/down/left/right) |
@@ -569,7 +585,7 @@ curl -X POST http://localhost:9377/tabs/TAB_ID/navigate \
 | `GET` | `/tabs/:id/links` | Extract all links on page |
 | `GET` | `/tabs/:id/images` | List `<img>` elements. Query params: `includeData=true` (return inline data URLs), `maxBytes=N`, `limit=N` |
 | `GET` | `/tabs/:id/downloads` | List captured downloads. Query params: `includeData=true` (base64 file data), `consume=true` (clear after read), `maxBytes=N` |
-| `GET` | `/tabs/:id/screenshot` | Take screenshot |
+| `GET` | `/tabs/:id/screenshot` | Viewport PNG + `X-Camofox-Visual-Metadata` (`visualCapture`) header for coordinate clicks; `fullPage=true` for a legacy full-page PNG without metadata |
 | `POST` | `/tabs/:id/back` | Go back |
 | `POST` | `/tabs/:id/forward` | Go forward |
 | `POST` | `/tabs/:id/refresh` | Refresh page |

@@ -14,9 +14,11 @@ npm install && npm start
 
 1. **Create a tab** -> Get `tabId`
 2. **Navigate** -> Go to URL or use search macro
-3. **Get snapshot** -> Receive page content with element refs (`e1`, `e2`, etc.)
-4. **Interact** -> Click/type using refs
+3. **Observe** -> Screenshot-first for visual targets (`/screenshot` + `visualCapture` metadata), or snapshot for element refs (`e1`, `e2`, etc.)
+4. **Interact** -> Click by image-pixel `coordinates` with a fresh `captureId`, or fall back to ref/selector; type by ref
 5. **Repeat** steps 3-4 as needed
+
+Coordinate clicks target what you can see in a screenshot: take a viewport screenshot, pick the pixel in that PNG, and click it with the `captureId` from the response metadata. Captures expire after 120 seconds and are invalidated by navigation, snapshot, typing, scrolling, viewport changes, clicks, and newer captures -- on `409 stale_visual_capture`, take a fresh screenshot and retry. Keep `evaluate` read-only between a screenshot and its coordinate click (it is the read/poll path and does not invalidate captures, but mutating scripts can move the page). Use refs via snapshot for typing, ambiguous or moving targets, and iframe targets where the click point is unclear.
 
 ## API Reference
 
@@ -46,13 +48,26 @@ Returns accessibility tree with refs:
 [link e1] More information...
 ```
 
+### Take Screenshot
+```bash
+GET /tabs/:tabId/screenshot?userId=agent1
+```
+Returns raw `image/png`. Viewport screenshots include an `X-Camofox-Visual-Metadata` response header: base64url-encoded UTF-8 JSON with `captureId`, `imageWidth`, `imageHeight`, `viewportWidth`, `viewportHeight`, `devicePixelRatio`, `scrollX`, `scrollY`, `url`, and `capturedAt`. That capture is the only valid target for coordinate clicks. `fullPage=true` returns the legacy full-page PNG without metadata (serialized with other tab actions) and invalidates any existing viewport capture; a failed viewport-capture attempt also clears the previous capture. A screenshot is not needed for ref/selector interactions.
+
 ### Click Element
 ```bash
+# Screenshot-first: take a screenshot, read captureId from its
+# X-Camofox-Visual-Metadata header, then click an image pixel.
 POST /tabs/:tabId/click
+{"userId": "agent1", "coordinates": {"x": 412, "y": 268, "captureId": "<captureId>"}}
+# Optional: "doubleClick": true (coordinates only), or "includeScreenshot": true
+# to return the next viewport screenshot + fresh visualCapture (refsAvailable=false).
+
+# Fallback -- click by ref or CSS selector (no screenshot needed):
 {"userId": "agent1", "ref": "e1"}
-# Or CSS selector:
 {"userId": "agent1", "selector": "button.submit"}
 ```
+Coordinates are pixels in the screenshot PNG image (not CSS pixels) and cannot be combined with ref/selector.
 
 ### Type Text
 ```bash
@@ -121,7 +136,7 @@ Refs like `e1`, `e2` are stable identifiers for page elements:
 npm start
 # Or: ./run.sh
 ```
-Firefox-based with anti-detection. Bypasses Google captcha.
+Firefox-based with anti-detection fingerprint spoofing.
 
 ## Testing
 
@@ -151,6 +166,7 @@ docker run -p 9377:9377 camofox-browser
 - `lib/cookies.js` - Cookie file I/O
 - `lib/metrics.js` - Prometheus metrics (lazy-loaded, off by default -- set `PROMETHEUS_ENABLED=1`)
 - `lib/request-utils.js` - HTTP request classification helpers (`actionFromReq`, `classifyError`)
+- `lib/visual-capture.js` - Screenshot-coordinate capture/validation (viewport PNG + `visualCapture` metadata, 120s freshness, image-pixel -> CSS mapping)
 - `lib/snapshot.js` - Accessibility tree snapshot
 - `lib/macros.js` - Search macro URL expansion
 - `lib/plugins.js` - Plugin loader and event bus
@@ -363,7 +379,7 @@ export function register(app, ctx) {
 #### Input
 | Event | Payload |
 |-------|---------|
-| `tab:click` | `{ userId, tabId, ref, selector }` |
+| `tab:click` | `{ userId, tabId, ref, selector, coordinates? }` (`coordinates` = mapped CSS x/y when a coordinate click was used) |
 | `tab:type` | `{ userId, tabId, text, ref, mode }` |
 | `tab:scroll` | `{ userId, tabId, direction, amount }` |
 | `tab:press` | `{ userId, tabId, key }` |

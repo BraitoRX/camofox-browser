@@ -80,7 +80,7 @@
       },
       {
         "name": "camofox_click",
-        "description": "Click an element by ref or CSS selector"
+        "description": "Click an element by ref, CSS selector, or screenshot coordinates"
       },
       {
         "name": "camofox_type",
@@ -96,7 +96,7 @@
       },
       {
         "name": "camofox_screenshot",
-        "description": "Capture page screenshot"
+        "description": "Capture a viewport screenshot with coordinate-capture metadata"
       },
       {
         "name": "camofox_close_tab",

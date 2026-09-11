@@ -849,8 +849,8 @@
         "tags": [
           "Interaction"
         ],
-        "summary": "Click an element",
-        "description": "Click by element ref, CSS selector, or coordinates.",
+        "summary": "Click an element or screenshot coordinate",
+        "description": "Click by element ref, CSS selector, or image-pixel coordinates from the latest viewport screenshot. Coordinates must carry the captureId from that screenshot's visualCapture metadata and are mapped proportionally onto the CSS viewport. Stale or mismatched captures are rejected with 409 stale_visual_capture; coordinates cannot be combined with ref/selector.\n",
         "parameters": [
           {
             "name": "tabId",
@@ -883,18 +883,33 @@
                     "description": "CSS selector fallback."
                   },
                   "doubleClick": {
-                    "type": "boolean"
+                    "type": "boolean",
+                    "description": "Double-click (only used with coordinates)."
+                  },
+                  "includeScreenshot": {
+                    "type": "boolean",
+                    "description": "Return a post-click viewport screenshot plus visualCapture metadata instead of rebuilding element refs (refsAvailable=false).\n"
                   },
                   "coordinates": {
                     "type": "object",
+                    "description": "Image-pixel coordinates in the latest standalone screenshot (its visualCapture.captureId). Mutually exclusive with ref/selector.\n",
+                    "required": [
+                      "x",
+                      "y",
+                      "captureId"
+                    ],
                     "properties": {
                       "x": {
                         "type": "number"
                       },
                       "y": {
                         "type": "number"
+                      },
+                      "captureId": {
+                        "type": "string"
                       }
-                    }
+                    },
+                    "additionalProperties": false
                   }
                 }
               }
@@ -903,7 +918,7 @@
         },
         "responses": {
           "200": {
-            "description": "Click result with optional post-action snapshot.",
+            "description": "Click result with optional post-action screenshot and visualCapture metadata.",
             "content": {
               "application/json": {
                 "schema": {
@@ -913,7 +928,7 @@
             }
           },
           "400": {
-            "description": "Bad request.",
+            "description": "Bad request (invalid_coordinates for malformed or out-of-range coordinates).",
             "content": {
               "application/json": {
                 "schema": {
@@ -933,7 +948,7 @@
             }
           },
           "409": {
-            "description": "Page changed during the click; caller should take a fresh snapshot and retry with current refs.",
+            "description": "Page changed or visual capture is stale; retry with a fresh screenshot/snapshot.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1829,7 +1844,7 @@
           "Content"
         ],
         "summary": "Take a screenshot",
-        "description": "Returns a base64-encoded PNG screenshot.",
+        "description": "Returns a raw PNG. By default the screenshot is viewport-only and the response carries an X-Camofox-Visual-Metadata header (base64url-encoded UTF-8 JSON) with the visualCapture metadata used by coordinate clicks. fullPage=true returns the legacy full-page PNG without metadata and invalidates any existing viewport capture.\n",
         "parameters": [
           {
             "name": "tabId",
@@ -1846,28 +1861,33 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "fullPage",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Return a full-page PNG instead of a viewport capture; no visualCapture metadata is produced."
           }
         ],
         "responses": {
           "200": {
-            "description": "Screenshot.",
-            "content": {
-              "application/json": {
+            "description": "Raw PNG screenshot. Viewport captures include the X-Camofox-Visual-Metadata header; fullPage=true does not.",
+            "headers": {
+              "X-Camofox-Visual-Metadata": {
+                "description": "base64url-encoded UTF-8 JSON visualCapture metadata for viewport captures.",
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "screenshot": {
-                      "type": "object",
-                      "properties": {
-                        "data": {
-                          "type": "string"
-                        },
-                        "mimeType": {
-                          "type": "string"
-                        }
-                      }
-                    }
-                  }
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
                 }
               }
             }

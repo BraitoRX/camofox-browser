@@ -274,4 +274,9 @@ describe('classifyError categorizes timeout vs proxy', () => {
     expect(classifyError(new Error('Element is not attached to the DOM'))).toBe('element_error');
     expect(classifyError(new Error('Target crashed'))).toBe('page_crashed');
   });
+
+  test('coordinate capture errors classify distinctly', () => {
+    expect(classifyError(Object.assign(new Error('coordinates.x and coordinates.y must be finite numbers (image pixels)'), { code: 'invalid_coordinates' }))).toBe('invalid_coordinates');
+    expect(classifyError(Object.assign(new Error('No matching visual capture. Take a fresh screenshot and use its captureId.'), { code: 'stale_visual_capture' }))).toBe('stale_visual_capture');
+  });
 });
