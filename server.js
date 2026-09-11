@@ -78,6 +78,7 @@ import {
   snapshotNavigationGuard,
   transferNavigationGuard,
 } from './lib/navigation-guard.js';
+import { withNativeInput, createStallRecovery } from './lib/native-input.js';
 
 const CONFIG = loadConfig();
 
@@ -613,6 +614,23 @@ function withTimeout(promise, ms, label) {
       setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
     )
   ]);
+}
+
+// Browser-wide native input serialization + stall recovery. `restartBrowser`
+// and `log` are function declarations defined later; hoisting makes these
+// early references valid.
+const nativeInputRecovery = createStallRecovery({ restartBrowser, log });
+const NATIVE_INPUT_TIMEOUT_RE = /native (?:coordinate click|mouse move|mouse down|mouse up|mouse sequence|scroll wheel) timed out after/;
+const NATIVE_WHEEL_TIMEOUT_MS = 10000;
+async function dispatchNativeInput({ label, budget, run, probe, meta = {} }) {
+  try {
+    return await withNativeInput(() => withTimeout(run(), Math.max(1, typeof budget === 'function' ? budget() : budget), label));
+  } catch (err) {
+    if (NATIVE_INPUT_TIMEOUT_RE.test(String((err && err.message) || ''))) {
+      await nativeInputRecovery.afterNativeInputTimeout({ probe, meta }).catch(() => {});
+    }
+    throw err;
+  }
 }
 
 function requestTimeoutMs(baseMs = HANDLER_TIMEOUT_MS) {
@@ -4072,13 +4090,21 @@ app.post('/tabs/:tabId/click', async (req, res) => {
         const y = box.y + box.height / 2;
         
         // Move mouse to element (triggers mouseover/mouseenter)
-        await withTimeout(tabState.page.mouse.move(x, y), Math.max(1, remainingBudget()), 'native mouse move');
-        await tabState.page.waitForTimeout(50);
-        
-        // Full click sequence
-        await withTimeout(tabState.page.mouse.down(), Math.max(1, remainingBudget()), 'native mouse down');
-        await tabState.page.waitForTimeout(50);
-        await withTimeout(tabState.page.mouse.up(), Math.max(1, remainingBudget()), 'native mouse up');
+        await dispatchNativeInput({
+          label: 'native mouse sequence',
+          budget: remainingBudget,
+          run: async () => {
+            await withTimeout(tabState.page.mouse.move(x, y), Math.max(1, remainingBudget()), 'native mouse move');
+            await tabState.page.waitForTimeout(50);
+            
+            // Full click sequence
+            await withTimeout(tabState.page.mouse.down(), Math.max(1, remainingBudget()), 'native mouse down');
+            await tabState.page.waitForTimeout(50);
+            await withTimeout(tabState.page.mouse.up(), Math.max(1, remainingBudget()), 'native mouse up');
+          },
+          probe: () => tabState.page.mouse.move(x, y),
+          meta: { reqId: req.reqId, tabId },
+        });
         
         log('info', 'mouse sequence dispatched', { x: x.toFixed(0), y: y.toFixed(0) });
       };
@@ -4167,17 +4193,21 @@ app.post('/tabs/:tabId/click', async (req, res) => {
             const target = await inspectGuardedCoordinates(tabState.page, cssX, cssY);
             guardEntry.target = target;
             guardEntry.dispatchRequested = true;
-            await clickWithDownloadGuard(tabState, () => withTimeout(
-              tabState.page.mouse.click(cssX, cssY, { clickCount: 1 }),
-              Math.max(1, remainingBudget()),
-              'native coordinate click',
-            ));
+            await clickWithDownloadGuard(tabState, () => dispatchNativeInput({
+              label: 'native coordinate click',
+              budget: remainingBudget,
+              run: () => tabState.page.mouse.click(cssX, cssY, { clickCount: 1 }),
+              probe: () => tabState.page.mouse.move(cssX, cssY),
+              meta: { reqId: req.reqId, tabId },
+            }));
           } else {
-            await clickWithDownloadGuard(tabState, () => withTimeout(
-              tabState.page.mouse.click(cssX, cssY, { clickCount: doubleClick ? 2 : 1 }),
-              Math.max(1, remainingBudget()),
-              'native coordinate click',
-            ));
+            await clickWithDownloadGuard(tabState, () => dispatchNativeInput({
+              label: 'native coordinate click',
+              budget: remainingBudget,
+              run: () => tabState.page.mouse.click(cssX, cssY, { clickCount: doubleClick ? 2 : 1 }),
+              probe: () => tabState.page.mouse.move(cssX, cssY),
+              meta: { reqId: req.reqId, tabId },
+            }));
           }
         } else if (ref) {
           let locator = refToLocator(tabState.page, ref, tabState.refs);
@@ -5209,7 +5239,12 @@ app.post('/tabs/:tabId/scroll', async (req, res) => {
     await withTabLock(req.params.tabId, async () => {
       const isVertical = direction === 'up' || direction === 'down';
       const delta = (direction === 'up' || direction === 'left') ? -amount : amount;
-      await tabState.page.mouse.wheel(isVertical ? 0 : delta, isVertical ? delta : 0);
+      await dispatchNativeInput({
+        label: 'native scroll wheel',
+        budget: () => NATIVE_WHEEL_TIMEOUT_MS,
+        run: () => tabState.page.mouse.wheel(isVertical ? 0 : delta, isVertical ? delta : 0),
+        probe: () => tabState.page.mouse.move(2, 2),
+      });
       await tabState.page.waitForTimeout(300);
     });
     
@@ -7554,7 +7589,12 @@ app.post('/act', async (req, res) => {
           } else {
             const isVertical = direction === 'up' || direction === 'down';
             const delta = (direction === 'up' || direction === 'left') ? -amount : amount;
-            await tabState.page.mouse.wheel(isVertical ? 0 : delta, isVertical ? delta : 0);
+            await dispatchNativeInput({
+              label: 'native scroll wheel',
+              budget: () => NATIVE_WHEEL_TIMEOUT_MS,
+              run: () => tabState.page.mouse.wheel(isVertical ? 0 : delta, isVertical ? delta : 0),
+              probe: () => tabState.page.mouse.move(2, 2),
+            });
           }
           await tabState.page.waitForTimeout(300);
           return { ok: true, targetId };

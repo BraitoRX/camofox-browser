@@ -184,6 +184,7 @@ docker run -p 9377:9377 camofox-browser
 - `lib/request-utils.js` - HTTP request classification helpers (`actionFromReq`, `classifyError`)
 - `lib/visual-capture.js` - Screenshot-coordinate capture/validation (viewport PNG + `visualCapture` metadata, 120s freshness, image-pixel -> CSS mapping)
 - `lib/navigation-guard.js` - Per-tab opt-in links-only navigation guard state (action/transition/popup ledgers, retry budget, popup inheritance)
+- `lib/native-input.js` - Browser-wide native mouse input serialization + input-stall probe with auto browser restart (`input_stall`)
 - `lib/snapshot.js` - Accessibility tree snapshot
 - `lib/macros.js` - Search macro URL expansion
 - `lib/plugins.js` - Plugin loader and event bus
