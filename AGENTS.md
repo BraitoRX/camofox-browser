@@ -18,7 +18,7 @@ npm install && npm start
 4. **Interact** -> Click by image-pixel `coordinates` with a fresh `captureId`, or fall back to ref/selector; type by ref
 5. **Repeat** steps 3-4 as needed
 
-Coordinate clicks target what you can see in a screenshot: take a viewport screenshot, pick the pixel in that PNG, and click it with the `captureId` from the response metadata. Captures expire after 120 seconds and are invalidated by navigation, snapshot, typing, scrolling, viewport changes, clicks, and newer captures -- on `409 stale_visual_capture`, take a fresh screenshot and retry. Keep `evaluate` read-only between a screenshot and its coordinate click (it is the read/poll path and does not invalidate captures, but mutating scripts can move the page). Use refs via snapshot for typing, ambiguous or moving targets, and iframe targets where the click point is unclear.
+Coordinate clicks target what you can see in a screenshot: take a viewport screenshot, pick the pixel in that PNG, and click it with the `captureId` from the response metadata. Captures expire after 120 seconds and are invalidated by navigation, snapshot, typing, scrolling, viewport changes, clicks, and newer captures -- on `409 stale_visual_capture`, take a fresh screenshot and retry. Keep `evaluate` read-only between a screenshot and its coordinate click (it is the read/poll path and does not invalidate captures, but mutating scripts can move the page) -- `evaluate` is blocked entirely while the opt-in links-only navigation guard is active on that tab. Use refs via snapshot for typing, ambiguous or moving targets, and iframe targets where the click point is unclear.
 
 ## API Reference
 
@@ -88,6 +88,22 @@ POST /tabs/:tabId/back     {"userId": "agent1"}
 POST /tabs/:tabId/forward  {"userId": "agent1"}
 POST /tabs/:tabId/refresh  {"userId": "agent1"}
 ```
+
+### Navigation Guard (opt-in links-only)
+
+Off by default. One-way: there is no reset route, and a repeated start with the original URL does not reset the guard. While active on a tab, arbitrary JavaScript (`/evaluate`), direct navigation, typing, pressing, selecting, uploading, history/refresh/wait, and legacy action routes are blocked; native visible HTTP(S) hyperlink clicks (no `download` attribute), native scrolling, closing the tab, and read-only snapshot/screenshot/status remain allowed.
+
+```bash
+# Start: exact current HTTP(S) URL required.
+POST /tabs/:tabId/navigation-guard
+{"userId": "agent1", "expectedUrl": "https://example.com/"}
+
+# Status: bounded ledger (last 100 actions/transitions/popup observations + lifetime counters).
+# Never activates, resets, or refreshes the guard.
+GET /tabs/:tabId/navigation-guard?userId=agent1
+```
+
+After a failed or no-change action, take a fresh successful screenshot or a non-cached snapshot before retrying; one corrected retry is allowed on the unchanged URL, then stop (`409 guard_retry_exhausted`). Popups inherit independent ledgers. There is no reset API, and opening an unguarded tab or using another client circumvents the guard -- it is a per-tab workflow policy, not a security sandbox. Do not open an unguarded tab or use another client to bypass the task constraint.
 
 ### Get Links
 ```bash
@@ -167,6 +183,7 @@ docker run -p 9377:9377 camofox-browser
 - `lib/metrics.js` - Prometheus metrics (lazy-loaded, off by default -- set `PROMETHEUS_ENABLED=1`)
 - `lib/request-utils.js` - HTTP request classification helpers (`actionFromReq`, `classifyError`)
 - `lib/visual-capture.js` - Screenshot-coordinate capture/validation (viewport PNG + `visualCapture` metadata, 120s freshness, image-pixel -> CSS mapping)
+- `lib/navigation-guard.js` - Per-tab opt-in links-only navigation guard state (action/transition/popup ledgers, retry budget, popup inheritance)
 - `lib/snapshot.js` - Accessibility tree snapshot
 - `lib/macros.js` - Search macro URL expansion
 - `lib/plugins.js` - Plugin loader and event bus

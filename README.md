@@ -84,7 +84,9 @@ The Docker image includes yt-dlp. For local dev, install it for the `/youtube/tr
 openclaw plugins install @askjo/camofox-browser
 ```
 
-**Tools:** `camofox_create_tab`  |  `camofox_snapshot`  |  `camofox_click`  |  `camofox_type`  |  `camofox_navigate`  |  `camofox_scroll`  |  `camofox_screenshot`  |  `camofox_close_tab`  |  `camofox_list_tabs`  |  `camofox_import_cookies`
+**Tools:** `camofox_create_tab`  |  `camofox_snapshot`  |  `camofox_click`  |  `camofox_type`  |  `camofox_navigate`  |  `camofox_scroll`  |  `camofox_screenshot`  |  `camofox_close_tab`  |  `camofox_evaluate`  |  `camofox_list_tabs`  |  `camofox_import_cookies`  |  `camofox_navigation_guard`
+
+*(`camofox_evaluate` was missing from this list. `camofox_navigation_guard` is a local addition — it appears only once the updated server and adapter source is loaded; editing source is not a deployment.)*
 
 ### Standalone
 
@@ -558,6 +560,30 @@ curl -X POST http://localhost:9377/tabs/TAB_ID/navigate \
   -d '{"userId": "agent1", "macro": "@google_search", "query": "best coffee beans"}'
 ```
 
+### Opt-in hyperlink-only navigation
+
+A per-tab, opt-in workflow policy for link-following tasks -- not a security sandbox and not a route optimizer (observed paths may include detours). While active on a tab, caller JavaScript (`/evaluate`), direct navigation, typing, pressing, selecting, uploading, history/refresh/wait, and legacy action routes are rejected; native visible HTTP(S) hyperlink clicks (no `download` attribute), native scrolling, closing the tab, and read-only snapshot/screenshot/status remain allowed.
+
+```bash
+# Start: the tab must be on this exact HTTP(S) URL right now.
+# One-way: there is no reset endpoint, and a repeated start with the
+# original URL is idempotent (it does not reset the guard).
+curl -X POST http://localhost:9377/tabs/TAB_ID/navigation-guard \
+  -H 'Content-Type: application/json' \
+  -d '{"userId": "agent1", "expectedUrl": "https://example.com/"}'
+
+# Status: read-only current-page probe + bounded ledger (last 100
+# actions/transitions/popup observations + lifetime counters).
+# Never activates, resets, or refreshes the guard.
+curl "http://localhost:9377/tabs/TAB_ID/navigation-guard?userId=agent1"
+```
+
+After a failed or no-change action, take a fresh successful screenshot (or a non-cached snapshot) before retrying -- one corrected retry is allowed on the unchanged URL, then stop (`409 guard_retry_exhausted`). Action receipts and navigation observations are independent: a receipt may report `error` even though the page then changed, and native input is never proven physically. Popup tabs inherit independent guard ledgers; each ledger keeps the last 100 entries per stream with lifetime counters and dropped counts, in memory only (no reset API, not a persistent log).
+
+Guard errors: `navigation_guard_violation` (`400` malformed start or current-URL mismatch while inactive, `403` blocked action, `409` unreadable current page URL), `409 guard_start_mismatch` (start on an already-active guard with a different original `expectedUrl`), `422 guard_invalid_target`, `409 guard_observation_required` (fresh image or non-cached snapshot needed), `409 guard_retry_exhausted`, `409 guard_click_failed`; a missing tab is a normal `404`/`410`. Setup steps, Google/search-macro navigation, and transport, body-shape, or early-policy rejections before ledger admission are not covered -- regardless of when the guard was activated.
+
+> The route and the `camofox_navigation_guard` tool ship with this source tree. They are reachable only after the local server (and the MCP/OpenClaw adapter) loads the updated source -- editing source is not a deployment.
+
 ## API
 
 ### Tab Lifecycle
@@ -581,6 +607,8 @@ curl -X POST http://localhost:9377/tabs/TAB_ID/navigate \
 | `POST` | `/tabs/:id/press` | Press a keyboard key |
 | `POST` | `/tabs/:id/scroll` | Scroll page (up/down/left/right) |
 | `POST` | `/tabs/:id/navigate` | Navigate to URL or search macro |
+| `POST` | `/tabs/:id/navigation-guard` | Start the opt-in links-only guard: pass `expectedUrl` with the tab's exact current HTTP(S) URL (one-way; no reset) |
+| `GET` | `/tabs/:id/navigation-guard` | Guard status ledger (last 100 actions/transitions/popup observations + lifetime counters); does not activate, reset, or refresh |
 | `POST` | `/tabs/:id/wait` | Wait for selector or timeout |
 | `GET` | `/tabs/:id/links` | Extract all links on page |
 | `GET` | `/tabs/:id/images` | List `<img>` elements. Query params: `includeData=true` (return inline data URLs), `maxBytes=N`, `limit=N` |

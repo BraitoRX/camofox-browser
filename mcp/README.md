@@ -2,7 +2,7 @@
 
 A standalone [Model Context Protocol](https://modelcontextprotocol.io) server that exposes camofox-browser to any MCP-compatible host — Claude Code, Cursor, etc. — without requiring OpenClaw.
 
-It mirrors the existing OpenClaw plugin **1:1**: same 11 tool names, identical JSON-Schema parameters, and the same REST routes. Whether an agent reaches camofox via OpenClaw or MCP, the behavior is identical.
+It mirrors the existing OpenClaw plugin **1:1**: same 12 tool names, identical JSON-Schema parameters, and the same REST routes. Whether an agent reaches camofox via OpenClaw or MCP, the behavior is identical.
 
 The initial MCP server implementation was contributed by [@epicsagas](https://github.com/epicsagas).
 
@@ -170,7 +170,7 @@ claude mcp add camofox-browser -- node /Users/you/src/camofox-browser/mcp/server
 | Cursor | Settings → MCP — server shows green |
 | opencode | `opencode mcp list` |
 
-You should see 11 tools: `camofox_create_tab`, `camofox_snapshot`, `camofox_click`, `camofox_type`, `camofox_navigate`, `camofox_scroll`, `camofox_screenshot`, `camofox_evaluate`, `camofox_list_tabs`, `camofox_close_tab`, `camofox_import_cookies`.
+You should see 12 tools once the MCP server runs the updated adapter from this checkout: `camofox_create_tab`, `camofox_snapshot`, `camofox_click`, `camofox_type`, `camofox_navigate`, `camofox_scroll`, `camofox_screenshot`, `camofox_evaluate`, `camofox_list_tabs`, `camofox_close_tab`, `camofox_import_cookies`, `camofox_navigation_guard`. The guard is a local addition: older published adapter builds do not advertise it. Editing these files does not update running processes; both the REST server and adapter must load the updated source. Restart/reload only with appropriate authorization.
 
 ## Tools
 
@@ -181,12 +181,22 @@ You should see 11 tools: `camofox_create_tab`, `camofox_snapshot`, `camofox_clic
 | `camofox_navigate` | Go to a URL **or** use a search macro (`@google_search`, `@reddit_search`, ...) |
 | `camofox_click` | Click by element ref (`e1`), CSS selector, or screenshot coordinates `{x, y, captureId}` |
 | `camofox_type` | Type text into a ref/selector, optional `pressEnter` |
-| `camofox_scroll` | Scroll by pixels (unreliable on lazy-load pages — prefer `camofox_evaluate`) |
+| `camofox_scroll` | Scroll by pixels (unreliable on lazy-load pages — prefer `camofox_evaluate` on unguarded tabs; an active navigation guard requires this native scroll) |
 | `camofox_screenshot` | Viewport screenshot + `visualCapture` metadata (`captureId`) for coordinate clicks |
-| `camofox_evaluate` | Run JS in page context — extract data, call page APIs, scroll via `window.scrollTo` |
+| `camofox_evaluate` | Run JS in page context — extract data, call page APIs, scroll via `window.scrollTo` (unguarded tabs only; an active navigation guard rejects `evaluate` — use native scroll + snapshot/status instead) |
 | `camofox_list_tabs` | List open tabs in this session |
 | `camofox_close_tab` | Close a tab |
 | `camofox_import_cookies` | Import a Netscape cookie file (needs `CAMOFOX_API_KEY`) |
+| `camofox_navigation_guard` | Start/inspect an opt-in links-only guard: blocks caller JS and direct navigation, allows native hyperlink clicks, bounded ledger |
+
+### Navigation guard (opt-in)
+
+```js
+camofox_navigation_guard({ tabId, action: 'start', expectedUrl: 'https://example.com/' })
+camofox_navigation_guard({ tabId, action: 'status' }) // read-only probe + bounded ledger; does not activate/reset/refresh
+```
+
+Start requires the tab's exact current HTTP(S) URL and is one-way (no reset). While active on that tab, `evaluate`, direct navigation, typing/pressing/selecting/uploading, history/refresh/wait, and legacy actions are blocked; native visible HTTP(S) hyperlinks (no `download` attribute), native scrolling, and read-only snapshot/screenshot/status remain allowed. After a failed or no-change action, take a fresh image or non-cached snapshot before retrying (one corrected retry, then `409 guard_retry_exhausted`). Popups inherit independent ledgers; each stream keeps the last 100 entries plus lifetime counters. This is a per-tab workflow policy, not a security sandbox -- new tabs, other clients, and site scripts are not stopped, and setup/transport/schema/early-policy rejections before ledger admission are not covered, regardless of when the guard was activated.
 
 ## Workflow
 

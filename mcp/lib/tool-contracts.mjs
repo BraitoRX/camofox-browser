@@ -1,7 +1,7 @@
 /**
  * Canonical tool contracts for the camofox-browser REST API.
  *
- * Single source of truth shared by two hosts that expose the same 11 tools:
+ * Single source of truth shared by two hosts that expose the same 12 tools:
  *   - mcp/server.mjs   (stdio MCP server for Claude Code, Codex, agy, Cursor, opencode)
  *   - plugin.ts        (OpenClaw plugin)
  *
@@ -64,7 +64,7 @@ const SEARCH_MACROS = [
 ];
 
 /**
- * The 11 tools, identical schema for both hosts. Edit here and both update.
+ * The 12 tools, identical schema for both hosts. Edit here and both update.
  * @type {ToolDef[]}
  */
 export const TOOL_DEFS = [
@@ -247,6 +247,28 @@ export const TOOL_DEFS = [
       required: ['cookiesPath'],
     },
   },
+  {
+    name: 'camofox_navigation_guard',
+    description:
+      'Opt-in, one-way links-only navigation guard for a single tab. While active, caller JavaScript, direct navigation, typing, pressing, selecting, uploading, history, refresh, wait, and legacy action tools are blocked on that tab; only native visible HTTP(S) hyperlink clicks (no download attribute), native scrolling and viewport changes, closing the tab, and read-only snapshot/screenshot/status are allowed. After a failed or no-change action, a fresh successful image or non-cached snapshot is required before retrying (one corrected retry on the unchanged URL). action:"start" activates the guard from the exact current HTTP(S) URL (expectedUrl); action:"status" reads the bounded ledger (last 100 actions/transitions/popup observations plus lifetime counters) without activating, resetting, or refreshing it. There is no disable/reset action.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string', description: 'Tab identifier' },
+        action: {
+          type: 'string',
+          enum: ['start', 'status'],
+          description: "'start' activates the guard; 'status' reads the ledger without changing it",
+        },
+        expectedUrl: {
+          type: 'string',
+          description:
+            'Required for action:"start": the exact observed HTTP(S) URL the tab is currently on. The server validates the match; malformed or mismatched starts are rejected.',
+        },
+      },
+      required: ['tabId', 'action'],
+    },
+  },
 ];
 
 /** Quick name → def lookup. */
@@ -364,6 +386,34 @@ export function buildRequest(name, args, ctx) {
     case 'camofox_import_cookies':
       // Async (Netscape parse + path check) — caller must use buildCookieRequest().
       throw new Error('camofox_import_cookies requires buildCookieRequest() (async cookie parsing)');
+    case 'camofox_navigation_guard': {
+      const tabId = typeof args.tabId === 'string' ? args.tabId.trim() : '';
+      if (!tabId) throw new Error('camofox_navigation_guard requires a non-empty tabId');
+      if (args.action !== 'start' && args.action !== 'status') {
+        throw new Error('camofox_navigation_guard action must be "start" or "status"');
+      }
+      const guardPath = `/tabs/${encodeURIComponent(args.tabId)}/navigation-guard`;
+      if (args.action === 'start') {
+        const expectedUrl = typeof args.expectedUrl === 'string' ? args.expectedUrl.trim() : '';
+        if (!expectedUrl) {
+          throw new Error('camofox_navigation_guard action "start" requires a non-empty expectedUrl');
+        }
+        return {
+          method: 'POST',
+          path: guardPath,
+          auth: 'accessKey',
+          responseKind: 'json',
+          body: { userId, expectedUrl: args.expectedUrl },
+        };
+      }
+      // status: read-only; expectedUrl is ignored and never spread into the request.
+      return {
+        method: 'GET',
+        path: `${guardPath}?${new URLSearchParams({ userId })}`,
+        auth: 'accessKey',
+        responseKind: 'json',
+      };
+    }
     default:
       throw new Error(`Unknown tool: ${name}`);
   }

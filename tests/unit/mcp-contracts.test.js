@@ -88,8 +88,8 @@ afterEach(() => {
 
 // --- Schema sanity ----------------------------------------------------------
 describe('TOOL_DEFS', () => {
-  test('exposes exactly 11 tools in stable order', () => {
-    expect(TOOL_DEFS).toHaveLength(11);
+  test('exposes exactly 12 tools in stable order', () => {
+    expect(TOOL_DEFS).toHaveLength(12);
     expect(TOOL_NAMES).toEqual([
       'camofox_create_tab',
       'camofox_snapshot',
@@ -102,6 +102,7 @@ describe('TOOL_DEFS', () => {
       'camofox_evaluate',
       'camofox_list_tabs',
       'camofox_import_cookies',
+      'camofox_navigation_guard',
     ]);
   });
 
@@ -140,6 +141,8 @@ describe('buildRequest', () => {
     ['camofox_close_tab', { tabId: 't1' }, { method: 'DELETE', path: '/tabs/t1?userId=u1', auth: 'accessKey', kind: 'json' }],
     ['camofox_evaluate', { tabId: 't1', expression: '1+1' }, { method: 'POST', path: '/tabs/t1/evaluate', auth: 'accessKey', kind: 'json' }],
     ['camofox_list_tabs', {}, { method: 'GET', path: '/tabs?userId=u1', auth: 'accessKey', kind: 'json' }],
+    ['camofox_navigation_guard', { tabId: 't1', action: 'status' }, { method: 'GET', path: '/tabs/t1/navigation-guard?userId=u1', auth: 'accessKey', kind: 'json' }],
+    ['camofox_navigation_guard', { tabId: 't1', action: 'start', expectedUrl: 'https://example.test/' }, { method: 'POST', path: '/tabs/t1/navigation-guard', auth: 'accessKey', kind: 'json' }],
   ])('%s → %s %s (auth=%s)', (name, args, expected) => {
     const spec = buildRequest(name, args, CTX);
     expect(spec.method).toBe(expected.method);
@@ -484,6 +487,8 @@ describe('host equivalence', () => {
     for (const name of TOOL_NAMES) {
       if (name === 'camofox_import_cookies') {
         expect(() => buildRequest(name, {}, CTX)).toThrow(/buildCookieRequest/);
+      } else if (name === 'camofox_navigation_guard') {
+        expect(() => buildRequest(name, { tabId: 't1', action: 'status' }, CTX)).not.toThrow();
       } else {
         expect(() => buildRequest(name, { tabId: 't1', url: 'u', expression: 'e', text: 'x', direction: 'down' }, CTX)).not.toThrow();
       }
