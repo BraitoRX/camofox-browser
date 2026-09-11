@@ -567,7 +567,7 @@
           "Navigation"
         ],
         "summary": "Navigate a tab to a URL or macro",
-        "description": "Navigate to a URL or expand a search macro. Auto-creates tab if not found.",
+        "description": "Navigate to a URL or expand a search macro. Auto-creates tab if not found. Direct navigation is blocked while the opt-in links-only navigation guard is active.",
         "parameters": [
           {
             "name": "tabId",
@@ -646,6 +646,16 @@
           },
           "400": {
             "description": "Bad request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Blocked by the active links-only navigation guard (code navigation_guard_violation). Direct navigation is not allowed on a protected tab; use visible hyperlink clicks instead.",
             "content": {
               "application/json": {
                 "schema": {
@@ -780,6 +790,7 @@
           "Interaction"
         ],
         "summary": "Wait for a selector or timeout",
+        "description": "Wait for a selector, timeout, or page readiness. Blocked while the opt-in links-only navigation guard is active.",
         "parameters": [
           {
             "name": "tabId",
@@ -831,6 +842,16 @@
               }
             }
           },
+          "403": {
+            "description": "Blocked by the active links-only navigation guard (code navigation_guard_violation). Wait is not allowed on a protected tab (it is not a read-only observation and may dismiss consent dialogs).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Tab not found.",
             "content": {
@@ -849,8 +870,8 @@
         "tags": [
           "Interaction"
         ],
-        "summary": "Click an element",
-        "description": "Click by element ref, CSS selector, or coordinates.",
+        "summary": "Click an element or screenshot coordinate",
+        "description": "Click by element ref, CSS selector, or image-pixel coordinates from the latest viewport screenshot. Coordinates must carry the captureId from that screenshot's visualCapture metadata and are mapped proportionally onto the CSS viewport. Stale or mismatched captures are rejected with 409 stale_visual_capture; coordinates cannot be combined with ref/selector. Under the opt-in links-only navigation guard the click must resolve to exactly one visible native http(s) hyperlink; force/raw-mouse fallbacks and doubleClick are refused, and the response includes an optional `action` receipt (status, outcome, navigationObserved, dispatchRequested -- a requested dispatch is not proof of a physical click).\n",
         "parameters": [
           {
             "name": "tabId",
@@ -883,18 +904,33 @@
                     "description": "CSS selector fallback."
                   },
                   "doubleClick": {
-                    "type": "boolean"
+                    "type": "boolean",
+                    "description": "Double-click (only used with coordinates)."
+                  },
+                  "includeScreenshot": {
+                    "type": "boolean",
+                    "description": "Return a post-click viewport screenshot plus visualCapture metadata instead of rebuilding element refs (refsAvailable=false).\n"
                   },
                   "coordinates": {
                     "type": "object",
+                    "description": "Image-pixel coordinates in the latest standalone screenshot (its visualCapture.captureId). Mutually exclusive with ref/selector.\n",
+                    "required": [
+                      "x",
+                      "y",
+                      "captureId"
+                    ],
                     "properties": {
                       "x": {
                         "type": "number"
                       },
                       "y": {
                         "type": "number"
+                      },
+                      "captureId": {
+                        "type": "string"
                       }
-                    }
+                    },
+                    "additionalProperties": false
                   }
                 }
               }
@@ -903,7 +939,7 @@
         },
         "responses": {
           "200": {
-            "description": "Click result with optional post-action snapshot.",
+            "description": "Click result with optional post-action screenshot and visualCapture metadata. Under the active guard the response also includes an `action` receipt.",
             "content": {
               "application/json": {
                 "schema": {
@@ -913,7 +949,17 @@
             }
           },
           "400": {
-            "description": "Bad request.",
+            "description": "Bad request (invalid_coordinates for malformed or out-of-range coordinates).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Blocked by the active links-only navigation guard (code navigation_guard_violation), e.g. doubleClick or a policy-denied click.",
             "content": {
               "application/json": {
                 "schema": {
@@ -933,7 +979,280 @@
             }
           },
           "409": {
-            "description": "Page changed during the click; caller should take a fresh snapshot and retry with current refs.",
+            "description": "Page changed or visual capture is stale; retry with a fresh screenshot/snapshot. Under the active guard, failed clicks return guard_click_failed, guard_retry_exhausted, or guard_observation_required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Guard target is not a single visible native hyperlink (code guard_invalid_target).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tabs/{tabId}/navigation-guard": {
+      "post": {
+        "tags": [
+          "Navigation"
+        ],
+        "summary": "Start the opt-in links-only navigation guard for a tab",
+        "description": "One-way, opt-in per-tab policy. While active, caller-supplied JavaScript (evaluate), direct navigation, typing, key presses, form selection, uploads, history navigation, refresh, and wait are blocked with 403 navigation_guard_violation; only native visible hyperlink clicks (ref/selector/coordinates), scrolling, viewport changes, screenshots/snapshots, closing, and guard status remain. expectedUrl must match the tab's current canonical http(s) URL exactly. Restarting with the original start URL is idempotent and never resets the ledger or retry budget; a different URL while active returns 409 guard_start_mismatch. There is no disable/reset action. This is a per-tab policy, not a security sandbox: other tabs, new tabs, other clients, and session management are out of scope. Requires a server running this route.\n",
+        "parameters": [
+          {
+            "name": "tabId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "userId",
+                  "expectedUrl"
+                ],
+                "properties": {
+                  "userId": {
+                    "type": "string"
+                  },
+                  "expectedUrl": {
+                    "type": "string",
+                    "description": "The tab's current canonical http(s) URL; must match exactly."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Guard is active; bounded ledger snapshot plus server-read page identity.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "guard": {
+                      "type": "object",
+                      "description": "Bounded guard snapshot.",
+                      "properties": {
+                        "mode": {
+                          "type": "string",
+                          "enum": [
+                            "links-only",
+                            "unrestricted"
+                          ]
+                        },
+                        "retryLimit": {
+                          "type": "integer"
+                        },
+                        "actions": {
+                          "type": "array",
+                          "items": {
+                            "type": "object"
+                          }
+                        },
+                        "counters": {
+                          "type": "object"
+                        },
+                        "truncated": {
+                          "type": "object"
+                        }
+                      }
+                    },
+                    "page": {
+                      "type": "object",
+                      "description": "Server-read page identity (static evaluate; not an observation).",
+                      "properties": {
+                        "url": {
+                          "type": "string"
+                        },
+                        "title": {
+                          "type": "string"
+                        },
+                        "h1": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing userId/expectedUrl, or expectedUrl is malformed/non-http(s)/does not match the current URL (navigation_guard_violation).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Blocked by the active guard policy (navigation_guard_violation).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tab not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A guard is already active with a different original start URL (guard_start_mismatch), or the current URL is unavailable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Tab was destroyed while the request waited for the tab lock.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Browser session expired; retry to get a fresh session.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "Navigation"
+        ],
+        "summary": "Get the per-tab navigation guard status and bounded ledger",
+        "description": "Read-only status for the opt-in links-only guard. Does not enable, disable, or reset the guard; does not count as a fresh observation and never resets the retry budget or counters. Returns {mode:'unrestricted'} when no guard is active. Requires a server running this route.\n",
+        "parameters": [
+          {
+            "name": "tabId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "userId",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Guard snapshot plus server-read page identity.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "guard": {
+                      "type": "object",
+                      "description": "Bounded guard snapshot (mode, counters, last 100 actions/navigation events, truncation flags)."
+                    },
+                    "page": {
+                      "type": "object",
+                      "description": "Server-read page identity (static evaluate; not an observation).",
+                      "properties": {
+                        "url": {
+                          "type": "string"
+                        },
+                        "title": {
+                          "type": "string"
+                        },
+                        "h1": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "userId required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tab not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Tab was destroyed while the request waited for the tab lock.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Browser session expired; retry to get a fresh session.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1015,6 +1334,16 @@
           "400": {
             "description": "Bad request (missing path/userId; non-regular file; or a path that is missing or outside the configured upload directory)."
           },
+          "403": {
+            "description": "Blocked by the active links-only navigation guard (code navigation_guard_violation). File upload is not allowed on a protected tab.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Tab not found."
           }
@@ -1087,6 +1416,16 @@
           },
           "400": {
             "description": "Bad request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Blocked by the active links-only navigation guard (code navigation_guard_violation). Typing is not allowed on a protected tab.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1184,6 +1523,16 @@
               }
             }
           },
+          "403": {
+            "description": "Blocked by the active links-only navigation guard (code navigation_guard_violation). Native form selection is not allowed on a protected tab.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Tab not found.",
             "content": {
@@ -1248,6 +1597,16 @@
                       "type": "boolean"
                     }
                   }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Blocked by the active links-only navigation guard (code navigation_guard_violation). Key presses are not allowed on a protected tab.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -1474,6 +1833,16 @@
               }
             }
           },
+          "403": {
+            "description": "Blocked by the active links-only navigation guard (code navigation_guard_violation). History navigation is not allowed on a protected tab.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Tab not found.",
             "content": {
@@ -1540,6 +1909,16 @@
               }
             }
           },
+          "403": {
+            "description": "Blocked by the active links-only navigation guard (code navigation_guard_violation). History navigation is not allowed on a protected tab.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Tab not found.",
             "content": {
@@ -1602,6 +1981,16 @@
                       "type": "string"
                     }
                   }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Blocked by the active links-only navigation guard (code navigation_guard_violation). Refresh is not allowed on a protected tab.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -1829,7 +2218,7 @@
           "Content"
         ],
         "summary": "Take a screenshot",
-        "description": "Returns a base64-encoded PNG screenshot.",
+        "description": "Returns a raw PNG. By default the screenshot is viewport-only and the response carries an X-Camofox-Visual-Metadata header (base64url-encoded UTF-8 JSON) with the visualCapture metadata used by coordinate clicks. fullPage=true returns the legacy full-page PNG without metadata and invalidates any existing viewport capture.\n",
         "parameters": [
           {
             "name": "tabId",
@@ -1846,28 +2235,33 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "fullPage",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Return a full-page PNG instead of a viewport capture; no visualCapture metadata is produced."
           }
         ],
         "responses": {
           "200": {
-            "description": "Screenshot.",
-            "content": {
-              "application/json": {
+            "description": "Raw PNG screenshot. Viewport captures include the X-Camofox-Visual-Metadata header; fullPage=true does not.",
+            "headers": {
+              "X-Camofox-Visual-Metadata": {
+                "description": "base64url-encoded UTF-8 JSON visualCapture metadata for viewport captures.",
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "screenshot": {
-                      "type": "object",
-                      "properties": {
-                        "data": {
-                          "type": "string"
-                        },
-                        "mimeType": {
-                          "type": "string"
-                        }
-                      }
-                    }
-                  }
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
                 }
               }
             }
@@ -2016,6 +2410,16 @@
           },
           "400": {
             "description": "Bad request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Blocked by the active links-only navigation guard (code navigation_guard_violation). Caller-supplied JavaScript is blocked outright on a protected tab; use snapshot, screenshot, or guard status instead.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2883,6 +3287,16 @@
               }
             }
           },
+          "403": {
+            "description": "Blocked by the active links-only navigation guard (code navigation_guard_violation). Legacy direct navigation is blocked on a protected tab.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Tab not found.",
             "content": {
@@ -3046,6 +3460,16 @@
           },
           "400": {
             "description": "Bad request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Blocked by the active links-only navigation guard (code navigation_guard_violation). The entire legacy /act surface is blocked on a protected tab; use the canonical guarded click/scroll routes instead.",
             "content": {
               "application/json": {
                 "schema": {

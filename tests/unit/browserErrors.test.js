@@ -112,6 +112,28 @@ describe('browser error normalization', () => {
     expect(isRetryableBrowserError(err)).toBe(false);
   });
 
+  test('stale visual captures normalize to retryable 409 screenshot recovery', () => {
+    const err = Object.assign(new Error('No matching visual capture. Take a fresh screenshot and use its captureId.'), {
+      code: 'stale_visual_capture',
+      statusCode: 409,
+    });
+    expect(browserErrorStatus(err)).toBe(409);
+    expect(browserErrorCode(err)).toBe('stale_visual_capture');
+    expect(browserErrorRecovery(err)).toBe('screenshot_then_retry');
+    expect(isRetryableBrowserError(err)).toBe(true);
+  });
+
+  test('invalid coordinates stay 400 and non-retryable', () => {
+    const err = Object.assign(new Error('coordinates.x and coordinates.y must be finite numbers (image pixels)'), {
+      code: 'invalid_coordinates',
+      statusCode: 400,
+    });
+    expect(browserErrorStatus(err)).toBe(400);
+    expect(browserErrorCode(err)).toBe('invalid_coordinates');
+    expect(browserErrorRecovery(err)).toBeNull();
+    expect(isRetryableBrowserError(err)).toBe(false);
+  });
+
   test('launch and user concurrency timeouts normalize to 503 retry', () => {
     const launch = new Error('Browser launch timeout (60s)');
     const concurrency = new Error('User concurrency limit reached, try again');

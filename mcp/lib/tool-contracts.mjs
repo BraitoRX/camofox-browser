@@ -1,7 +1,7 @@
 /**
  * Canonical tool contracts for the camofox-browser REST API.
  *
- * Single source of truth shared by two hosts that expose the same 11 tools:
+ * Single source of truth shared by two hosts that expose the same 12 tools:
  *   - mcp/server.mjs   (stdio MCP server for Claude Code, Codex, agy, Cursor, opencode)
  *   - plugin.ts        (OpenClaw plugin)
  *
@@ -64,7 +64,7 @@ const SEARCH_MACROS = [
 ];
 
 /**
- * The 11 tools, identical schema for both hosts. Edit here and both update.
+ * The 12 tools, identical schema for both hosts. Edit here and both update.
  * @type {ToolDef[]}
  */
 export const TOOL_DEFS = [
@@ -100,13 +100,37 @@ export const TOOL_DEFS = [
   },
   {
     name: 'camofox_click',
-    description: 'Click an element in a Camoufox tab by ref (e.g., e1) or CSS selector.',
+    description:
+      'Click in a Camoufox tab by element ref (e.g., e1), CSS selector, or image-pixel coordinates from the latest viewport screenshot. ' +
+      'For coordinates, call camofox_screenshot first and pass {x, y, captureId} where x/y are pixels in that PNG and captureId is its visualCapture.captureId; ' +
+      'the server maps image pixels to CSS pixels and rejects missing/stale/mismatched captures with 409 stale_visual_capture. ' +
+      'Set includeScreenshot:true to get the next viewport screenshot (plus visualCapture) back without rebuilding refs; otherwise refs are refreshed as before. ' +
+      'coordinates cannot be combined with ref or selector.',
     inputSchema: {
       type: 'object',
       properties: {
         tabId: { type: 'string', description: 'Tab identifier' },
         ref: { type: 'string', description: 'Element ref from snapshot (e.g., e1)' },
         selector: { type: 'string', description: 'CSS selector (alternative to ref)' },
+        coordinates: {
+          type: 'object',
+          description:
+            'Image-pixel coordinates in the latest standalone screenshot (camofox_screenshot, or the screenshot returned by a click with includeScreenshot:true). ' +
+            'x/y are pixels in that PNG image (not CSS pixels); captureId must be its visualCapture.captureId. Mutually exclusive with ref/selector.',
+          properties: {
+            x: { type: 'number', description: 'X pixel in the captured screenshot image (0 = left edge).' },
+            y: { type: 'number', description: 'Y pixel in the captured screenshot image (0 = top edge).' },
+            captureId: { type: 'string', description: 'captureId from the screenshot visualCapture metadata (required).' },
+          },
+          required: ['x', 'y', 'captureId'],
+          additionalProperties: false,
+        },
+        doubleClick: { type: 'boolean', description: 'Double-click at the coordinates (only used with coordinates).' },
+        includeScreenshot: {
+          type: 'boolean',
+          description:
+            'Return a post-click viewport screenshot plus visualCapture metadata instead of rebuilding element refs (refsAvailable=false).',
+        },
       },
       required: ['tabId'],
     },
@@ -160,7 +184,10 @@ export const TOOL_DEFS = [
   },
   {
     name: 'camofox_screenshot',
-    description: 'Take a screenshot of a Camoufox page.',
+    description:
+      'Take a viewport screenshot of a Camoufox page. Returns the PNG plus visualCapture metadata ' +
+      '(captureId, imageWidth/imageHeight, viewportWidth/viewportHeight, devicePixelRatio, scrollX/scrollY, url, capturedAt) ' +
+      'so the image can be used with camofox_click coordinates {x, y, captureId}. Captures expire after 120s and are invalidated by navigation, scrolling, typing, viewport changes, and clicks.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -220,6 +247,28 @@ export const TOOL_DEFS = [
       required: ['cookiesPath'],
     },
   },
+  {
+    name: 'camofox_navigation_guard',
+    description:
+      'Opt-in, one-way links-only navigation guard for a single tab. While active, caller JavaScript, direct navigation, typing, pressing, selecting, uploading, history, refresh, wait, and legacy action tools are blocked on that tab; only native visible HTTP(S) hyperlink clicks (no download attribute), native scrolling and viewport changes, closing the tab, and read-only snapshot/screenshot/status are allowed. After a failed or no-change action, a fresh successful image or non-cached snapshot is required before retrying (one corrected retry on the unchanged URL). action:"start" activates the guard from the exact current HTTP(S) URL (expectedUrl); action:"status" reads the bounded ledger (last 100 actions/transitions/popup observations plus lifetime counters) without activating, resetting, or refreshing it. There is no disable/reset action.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string', description: 'Tab identifier' },
+        action: {
+          type: 'string',
+          enum: ['start', 'status'],
+          description: "'start' activates the guard; 'status' reads the ledger without changing it",
+        },
+        expectedUrl: {
+          type: 'string',
+          description:
+            'Required for action:"start": the exact observed HTTP(S) URL the tab is currently on. The server validates the match; malformed or mismatched starts are rejected.',
+        },
+      },
+      required: ['tabId', 'action'],
+    },
+  },
 ];
 
 /** Quick name → def lookup. */
@@ -276,7 +325,9 @@ export function buildRequest(name, args, ctx) {
         method: 'POST',
         path: `/tabs/${args.tabId}/click`,
         auth: 'accessKey',
-        responseKind: 'json',
+        // includeScreenshot returns {screenshot:{data,mimeType}, visualCapture, ...};
+        // the snapshot adapter splits the embedded image into a native image block.
+        responseKind: args.includeScreenshot === true ? 'snapshot' : 'json',
         body: { ...without(args), userId },
       };
     case 'camofox_type':
@@ -335,6 +386,34 @@ export function buildRequest(name, args, ctx) {
     case 'camofox_import_cookies':
       // Async (Netscape parse + path check) — caller must use buildCookieRequest().
       throw new Error('camofox_import_cookies requires buildCookieRequest() (async cookie parsing)');
+    case 'camofox_navigation_guard': {
+      const tabId = typeof args.tabId === 'string' ? args.tabId.trim() : '';
+      if (!tabId) throw new Error('camofox_navigation_guard requires a non-empty tabId');
+      if (args.action !== 'start' && args.action !== 'status') {
+        throw new Error('camofox_navigation_guard action must be "start" or "status"');
+      }
+      const guardPath = `/tabs/${encodeURIComponent(args.tabId)}/navigation-guard`;
+      if (args.action === 'start') {
+        const expectedUrl = typeof args.expectedUrl === 'string' ? args.expectedUrl.trim() : '';
+        if (!expectedUrl) {
+          throw new Error('camofox_navigation_guard action "start" requires a non-empty expectedUrl');
+        }
+        return {
+          method: 'POST',
+          path: guardPath,
+          auth: 'accessKey',
+          responseKind: 'json',
+          body: { userId, expectedUrl: args.expectedUrl },
+        };
+      }
+      // status: read-only; expectedUrl is ignored and never spread into the request.
+      return {
+        method: 'GET',
+        path: `${guardPath}?${new URLSearchParams({ userId })}`,
+        auth: 'accessKey',
+        responseKind: 'json',
+      };
+    }
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -424,7 +503,21 @@ export async function fetchSpec(baseUrl, spec, config) {
       throw new Error(`Screenshot failed: ${text}`);
     }
     const data = Buffer.from(await res.arrayBuffer()).toString('base64');
-    return { type: 'image', data, mimeType: contentType };
+    const image = { type: 'image', data, mimeType: contentType };
+    // Viewport screenshots carry the capture metadata needed for coordinate
+    // clicks in X-Camofox-Visual-Metadata (base64url UTF-8 JSON). Legacy
+    // servers/clients without the header keep the bare image block.
+    const metaHeader = res.headers.get('x-camofox-visual-metadata');
+    if (metaHeader) {
+      try {
+        const visualCapture = JSON.parse(Buffer.from(metaHeader, 'base64url').toString('utf8'));
+        return { image, visualCapture };
+      } catch {
+        // Malformed metadata must not break the screenshot itself.
+        return image;
+      }
+    }
+    return image;
   }
   return res.json();
 }
@@ -464,6 +557,17 @@ export async function runTool(name, args, ctx, baseUrl, config) {
  */
 export function adaptResponse(spec, payload) {
   if (spec.responseKind === 'image') {
+    // Viewport screenshots arrive as {image, visualCapture} when the REST server
+    // attached capture metadata; emit the compact metadata text block first so
+    // the model can read it, then the native image block.
+    if (payload && typeof payload === 'object' && payload.image) {
+      const content = [];
+      if (payload.visualCapture) {
+        content.push({ type: 'text', text: JSON.stringify({ visualCapture: payload.visualCapture }) });
+      }
+      content.push(payload.image);
+      return content;
+    }
     return [payload];
   }
   if (spec.responseKind === 'snapshot') {

@@ -57,6 +57,27 @@ import {
   isTabLockQueueTimeout, isTabDestroyedError,
   browserErrorStatus, browserErrorCode, browserErrorRecovery, isRetryableBrowserError,
 } from './lib/browser-errors.js';
+import {
+  bindVisualCaptureInvalidation,
+  invalidCoordinatesError,
+  captureVisualState,
+  resolveCoordinatesToCss,
+} from './lib/visual-capture.js';
+import {
+  assertGuardedClickReady,
+  assertNavigationActionAllowed,
+  beginGuardedClick,
+  bindNavigationGuardObserver,
+  completeGuardedClick,
+  enableNavigationGuard,
+  guardError,
+  inheritNavigationGuard,
+  inspectGuardedCoordinates,
+  inspectGuardedLocator,
+  noteGuardObservation,
+  snapshotNavigationGuard,
+  transferNavigationGuard,
+} from './lib/navigation-guard.js';
 
 const CONFIG = loadConfig();
 
@@ -1475,7 +1496,29 @@ function isProxyError(err) {
     msg.includes('NS_ERROR_NET_TIMEOUT') || msg.includes('NS_ERROR_UNKNOWN_HOST');
 }
 
+// Navigation-guard policy errors are a deliberate outcome, not a browser
+// failure: answer directly and never run health tracking, telemetry, session
+// teardown, or proxy rotation for them.
+function isGuardError(err) {
+  if (!err || typeof err.code !== 'string') return false;
+  return err.code === 'navigation_guard_violation' || err.code.startsWith('guard_');
+}
+
+// Fresh-observation / corrected-retry denials are the only guard outcomes a
+// caller may retry after re-observing; policy denials and exhausted budgets are not.
+const GUARD_RETRYABLE_CODES = new Set(['guard_observation_required', 'guard_invalid_target', 'guard_click_failed']);
+
 function handleRouteError(err, req, res, extraFields = {}) {
+  if (isGuardError(err)) {
+    const retryable = GUARD_RETRYABLE_CODES.has(err.code);
+    return res.status(Number.isFinite(err.statusCode) ? err.statusCode : 403).json({
+      error: err.message,
+      code: err.code,
+      retryable,
+      recovery: retryable ? 'snapshot_then_retry' : 'none',
+      ...extraFields,
+    });
+  }
   const failureType = classifyError(err);
   const action = actionFromReq(req);
   failuresTotal.labels(failureType, action).inc();
@@ -1736,6 +1779,41 @@ function findTab(session, tabId) {
   return null;
 }
 
+// Resolve a tab's live state at guard-check time. A queued replacement (proxy
+// rotation or dead-page recovery) can swap the map entry while a request waits
+// for the tab lock, so guard decisions must never use a pre-lock capture.
+function currentTabState(userId, tabId) {
+  const session = sessions.get(normalizeUserId(userId));
+  const found = session && findTab(session, tabId);
+  return found ? found.tabState : null;
+}
+
+function isNavigationGuardActive(tabState) {
+  return Boolean(tabState && tabState.navigationGuard && tabState.navigationGuard.mode === 'links-only');
+}
+
+// Re-check the guard against the freshly resolved state inside a tab lock,
+// closing the activation-while-queued race. Fail-closed: a missing tab state
+// throws instead of silently skipping the policy check.
+function assertCurrentTabActionAllowed(userId, tabId, action) {
+  const current = currentTabState(userId, tabId);
+  if (!current) throw new Error('Tab destroyed');
+  assertNavigationActionAllowed(current, action);
+  return current;
+}
+
+// Server-owned static page identity read for the navigation-guard start/status
+// responses. Never accepts caller expressions or selectors, never waits/polls,
+// never writes to the DOM, and never counts as a guard observation. Exceptions
+// propagate to the route error handler.
+async function readGuardPageIdentity(page) {
+  return page.evaluate(() => ({
+    url: location.href,
+    title: document.title,
+    h1: (document.querySelector('#firstHeading') || document.querySelector('h1'))?.textContent?.trim().slice(0, 200) || '',
+  }));
+}
+
 // Return 404 or 410 depending on whether the browser restarted recently.
 // 410 Gone tells clients the tab existed but the browser crashed — create a new one.
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -1779,8 +1857,16 @@ function createTabState(page) {
     pressureObservedAt: Date.now(),
     pressureObservedToolCalls: 0,
     crashed: false,
+    // Latest screenshot-coordinate capture metadata for this tab (see
+    // lib/visual-capture.js); null when no capture is valid for coordinate clicks.
+    visualCapture: null,
+    // Opt-in per-tab links-only policy (lib/navigation-guard.js); null while
+    // unrestricted. Only POST /tabs/:tabId/navigation-guard enables it.
+    navigationGuard: null,
   };
   page?.on?.('crash', () => { tabState.crashed = true; });
+  bindVisualCaptureInvalidation(tabState, page);
+  bindNavigationGuardObserver(tabState);
   return tabState;
 }
 
@@ -1791,7 +1877,7 @@ function createTabState(page) {
  * The handler registers the popup in the same session's '__popups__' tab group
  * and recursively attaches itself to the new page.
  */
-function attachPopupHandler(page, userId, sessionKey) {
+function attachPopupHandler(page, userId, sessionKey, parentTabState = null) {
   page.on('popup', (popupPage) => {
     const key = normalizeUserId(userId);
     const currentSession = sessions.get(key);
@@ -1799,6 +1885,9 @@ function attachPopupHandler(page, userId, sessionKey) {
 
     const popupTabId = fly.makeTabId();
     const popupTabState = createTabState(popupPage);
+    // A guarded parent gives the popup its own independent guard (same
+    // links-only policy, separate ledger/budget). Unrestricted parents no-op.
+    inheritNavigationGuard(parentTabState, popupTabState, { tabId: popupTabId });
     attachDownloadListener(popupTabState, popupTabId, log, pluginEvents, key);
     const popupGroup = getTabGroup(currentSession, sessionKey || '__popups__');
     popupGroup.set(popupTabId, popupTabState);
@@ -1807,7 +1896,7 @@ function attachPopupHandler(page, userId, sessionKey) {
     log('info', 'popup registered as managed tab', { userId: key, tabId: popupTabId, url: safePageUrl(popupPage) });
     pluginEvents.emit('tab:created', { userId: key, tabId: popupTabId, page: popupPage, url: safePageUrl(popupPage) });
     // Recursively handle popups from the popup
-    attachPopupHandler(popupPage, userId, sessionKey);
+    attachPopupHandler(popupPage, userId, sessionKey, popupTabState);
   });
 }
 
@@ -1980,6 +2069,8 @@ async function isFallbackSearchBlocked(page, engine) {
 }
 
 async function rotateGoogleTab(userId, sessionKey, tabId, previousTabState, reason, reqId) {
+  // Protected tabs must never auto-rotate or replay Google setup.
+  assertNavigationActionAllowed(previousTabState, 'navigate');
   if (!previousTabState?.lastRequestedUrl || !isGoogleSearchUrl(previousTabState.lastRequestedUrl)) return null;
   if ((previousTabState.googleRetryCount || 0) >= 3) return null;
 
@@ -1996,12 +2087,13 @@ async function rotateGoogleTab(userId, sessionKey, tabId, previousTabState, reas
   const group = getTabGroup(session, sessionKey);
   const { page, lease } = await createLeasedPage(session);
   const tabState = createTabState(page);
+  transferNavigationGuard(previousTabState, tabState);
   tabState.googleRetryCount = (previousTabState.googleRetryCount || 0) + 1;
   tabState.lastRequestedUrl = previousTabState.lastRequestedUrl;
   attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
   group.set(tabId, tabState);
   releasePageLease(session, lease);
-  attachPopupHandler(page, userId, sessionKey);
+  attachPopupHandler(page, userId, sessionKey, tabState);
   refreshActiveTabsGauge();
 
   log('warn', 'replaying google search on fresh context (per-context proxy rotation)', {
@@ -2936,7 +3028,7 @@ app.post('/tabs', async (req, res) => {
       attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
       group.set(tabId, tabState);
       releasePageLease(session, lease);
-      attachPopupHandler(page, userId, resolvedSessionKey);
+      attachPopupHandler(page, userId, resolvedSessionKey, tabState);
       refreshActiveTabsGauge();
       
       if (url) {
@@ -2961,12 +3053,14 @@ app.post('/tabs', async (req, res) => {
             session = await getSession(userId, { trace: !!trace });
             const retryGroup = getTabGroup(session, resolvedSessionKey);
             const { page: retryPage, lease: retryLease } = await createLeasedPage(session);
+            const previousTabState = tabState;
             tabState = createTabState(retryPage);
+            transferNavigationGuard(previousTabState, tabState);
             tabState.lastRequestedUrl = url;
             attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
             retryGroup.set(tabId, tabState);
             releasePageLease(session, retryLease);
-            attachPopupHandler(retryPage, userId, resolvedSessionKey);
+            attachPopupHandler(retryPage, userId, resolvedSessionKey, tabState);
             refreshActiveTabsGauge();
             const navigationResponse = await withPageLoadDuration('open_url', () => navigatePage(retryPage, url));
             tabState.lastNavigationHttpStatus = typeof navigationResponse?.status === 'function' ? navigationResponse.status() : null;
@@ -3023,7 +3117,7 @@ app.post('/tabs', async (req, res) => {
  *   post:
  *     tags: [Navigation]
  *     summary: Navigate a tab to a URL or macro
- *     description: Navigate to a URL or expand a search macro. Auto-creates tab if not found.
+ *     description: Navigate to a URL or expand a search macro. Auto-creates tab if not found. Direct navigation is blocked while the opt-in links-only navigation guard is active.
  *     parameters:
  *       - name: tabId
  *         in: path
@@ -3085,6 +3179,12 @@ app.post('/tabs', async (req, res) => {
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Blocked by the active links-only navigation guard (code navigation_guard_violation). Direct navigation is not allowed on a protected tab; use visible hyperlink clicks instead.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  */
 app.post('/tabs/:tabId/navigate', async (req, res) => {
   const tabId = req.params.tabId;
@@ -3096,6 +3196,8 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
     let session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, tabId);
     if (!found) return tabNotFoundResponse(res, tabId);
+    // Opt-in guard: direct navigation is blocked while this tab is protected.
+    assertNavigationActionAllowed(found.tabState, 'navigate');
     session.lastAccess = Date.now();
 
     const result = await withUserLimit(userId, () => withTimeout((async () => {
@@ -3103,6 +3205,9 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
       const resolvedSessionKey = sessionKey || listItemId || found.listItemId || 'default';
       let tabState = found.tabState;
       tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+      // Navigation invalidates any screenshot capture; explicit here in addition
+      // to the main-frame navigation listener.
+      tabState.visualCapture = null;
       
       let targetUrl = url;
       if (macro && macro !== '__NO__' && macro !== 'none' && macro !== 'null') {
@@ -3118,6 +3223,10 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
       if (urlErr) throw new Error(urlErr);
       
       return await withTabLock(tabId, async () => {
+        // Re-check against the live state: the guard may have been enabled
+        // while this request waited for the lock. All actions below use this
+        // freshly resolved state, never the pre-lock capture.
+        tabState = assertCurrentTabActionAllowed(userId, tabId, 'navigate');
         const currentSessionKey = found?.listItemId || resolvedSessionKey;
         const isGoogleSearch = isGoogleSearchUrl(targetUrl);
         const isAmazonSearch = macro === '@amazon_search';
@@ -3224,10 +3333,11 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
           let replacementAttached = false;
           try {
             tabState = createTabState(replacementPage);
+            transferNavigationGuard(previousTabState, tabState);
             tabState.googleRetryCount = previousTabState.googleRetryCount || 0;
             attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
             group.set(tabId, tabState);
-            attachPopupHandler(replacementPage, userId, currentSessionKey);
+            attachPopupHandler(replacementPage, userId, currentSessionKey, tabState);
             replacementAttached = true;
           } finally {
             releasePageLease(session, replacementLease);
@@ -3301,7 +3411,10 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
         };
 
         const recreateTabOnFreshContext = async () => {
+          // Protected tabs must never auto-rotate or replay Google setup.
+          assertNavigationActionAllowed(tabState, 'navigate');
           const previousRetryCount = tabState.googleRetryCount || 0;
+          const previousTabState = tabState;
           browserRestartsTotal.labels('google_search_block').inc();
           // Rotate at context level -- destroy this user's session and create
           // a fresh one with a new proxy session. Does NOT restart the browser.
@@ -3314,11 +3427,12 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
           const group = getTabGroup(session, currentSessionKey);
           const { page, lease } = await createLeasedPage(session);
           tabState = createTabState(page);
+          transferNavigationGuard(previousTabState, tabState);
           tabState.googleRetryCount = previousRetryCount + 1;
           attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
           group.set(tabId, tabState);
           releasePageLease(session, lease);
-          attachPopupHandler(page, userId, currentSessionKey);
+          attachPopupHandler(page, userId, currentSessionKey, tabState);
           refreshActiveTabsGauge();
         };
 
@@ -3437,6 +3551,8 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
     pluginEvents.emit('tab:navigated', { userId: req.body.userId, tabId, url: result.url, prevUrl: null });
     res.json(result);
   } catch (err) {
+    // Guard denials answer directly; never log/recover/rotate for them.
+    if (isGuardError(err)) return handleRouteError(err, req, res);
     log('error', 'navigate failed', { reqId: req.reqId, tabId, error: err.message });
     const is400 = err.message && (err.message.startsWith('Blocked URL scheme') || err.message === 'url or macro required');
     if (is400) {
@@ -3539,6 +3655,9 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
     
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+    // Switching to snapshot/DOM-ref observation invalidates coordinate pixels:
+    // its bundled image (if any) is not a viewport coordinate capture.
+    tabState.visualCapture = null;
 
     // Cached chunk retrieval for offset>0 requests
     if (offset > 0 && tabState.lastSnapshot) {
@@ -3568,6 +3687,11 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
             tabState.lastSnapshot = rotated.tabState.lastSnapshot;
             tabState.lastRequestedUrl = rotated.tabState.lastRequestedUrl;
             tabState.googleRetryCount = rotated.tabState.googleRetryCount;
+            // The replacement page cannot reuse a capture from the old page, and
+            // the surviving tabState must watch the new page for main-frame
+            // navigations (the old listener is page-identity guarded).
+            tabState.visualCapture = null;
+            bindVisualCaptureInvalidation(tabState, tabState.page);
           }
         }
       }
@@ -3658,6 +3782,10 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
       return response;
     })(), requestTimeoutMs(), 'snapshot'));
 
+    // A fresh, delivered, non-paginated snapshot is a model observation: it
+    // reconciles the live URL and clears the observation requirement. The
+    // cached offset path returned above and is never counted.
+    noteGuardObservation(tabState);
     pluginEvents.emit('tab:snapshot', { userId: req.query.userId, tabId: req.params.tabId, snapshot: result.snapshot });
     log('info', 'snapshot', { reqId: req.reqId, tabId: req.params.tabId, url: result.url, snapshotLen: result.snapshot?.length, refsCount: result.refsCount, hasScreenshot: !!result.screenshot, truncated: result.truncated });
     res.json(result);
@@ -3674,6 +3802,7 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
  *   post:
  *     tags: [Interaction]
  *     summary: Wait for a selector or timeout
+ *     description: Wait for a selector, timeout, or page readiness. Blocked while the opt-in links-only navigation guard is active.
  *     parameters:
  *       - name: tabId
  *         in: path
@@ -3711,6 +3840,12 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Blocked by the active links-only navigation guard (code navigation_guard_violation). Wait is not allowed on a protected tab (it is not a read-only observation and may dismiss consent dialogs).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  */
 app.post('/tabs/:tabId/wait', async (req, res) => {
   try {
@@ -3718,13 +3853,21 @@ app.post('/tabs/:tabId/wait', async (req, res) => {
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, req.params.tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    // Opt-in guard: wait is blocked while this tab is protected (it may dismiss
+    // consent dialogs and is not a read-only observation path).
+    assertNavigationActionAllowed(found.tabState, 'wait');
     session.lastAccess = Date.now();
     
-    const { tabState } = found;
-    const ready = await waitForPageReady(tabState.page, { timeout, waitForNetwork, dismissConsent });
+    let { tabState } = found;
+    // Serialize with other tab actions and re-check the live state under the lock.
+    const ready = await withTabLock(req.params.tabId, async () => {
+      tabState = assertCurrentTabActionAllowed(userId, req.params.tabId, 'wait');
+      return waitForPageReady(tabState.page, { timeout, waitForNetwork, dismissConsent });
+    });
     
     res.json({ ok: true, ready });
   } catch (err) {
+    if (isGuardError(err)) return handleRouteError(err, req, res);
     log('error', 'wait failed', { reqId: req.reqId, error: err.message });
     handleRouteError(err, req, res);
   }
@@ -3736,8 +3879,18 @@ app.post('/tabs/:tabId/wait', async (req, res) => {
  * /tabs/{tabId}/click:
  *   post:
  *     tags: [Interaction]
- *     summary: Click an element
- *     description: Click by element ref, CSS selector, or coordinates.
+ *     summary: Click an element or screenshot coordinate
+ *     description: >
+ *       Click by element ref, CSS selector, or image-pixel coordinates from the
+ *       latest viewport screenshot. Coordinates must carry the captureId from
+ *       that screenshot's visualCapture metadata and are mapped proportionally
+ *       onto the CSS viewport. Stale or mismatched captures are rejected with
+ *       409 stale_visual_capture; coordinates cannot be combined with ref/selector.
+ *       Under the opt-in links-only navigation guard the click must resolve to
+ *       exactly one visible native http(s) hyperlink; force/raw-mouse fallbacks
+ *       and doubleClick are refused, and the response includes an optional
+ *       `action` receipt (status, outcome, navigationObserved, dispatchRequested
+ *       -- a requested dispatch is not proof of a physical click).
  *     parameters:
  *       - name: tabId
  *         in: path
@@ -3762,22 +3915,37 @@ app.post('/tabs/:tabId/wait', async (req, res) => {
  *                 description: CSS selector fallback.
  *               doubleClick:
  *                 type: boolean
+ *                 description: Double-click (only used with coordinates).
+ *               includeScreenshot:
+ *                 type: boolean
+ *                 description: >
+ *                   Return a post-click viewport screenshot plus visualCapture
+ *                   metadata instead of rebuilding element refs
+ *                   (refsAvailable=false).
  *               coordinates:
  *                 type: object
+ *                 description: >
+ *                   Image-pixel coordinates in the latest standalone screenshot
+ *                   (its visualCapture.captureId). Mutually exclusive with
+ *                   ref/selector.
+ *                 required: [x, y, captureId]
  *                 properties:
  *                   x:
  *                     type: number
  *                   y:
  *                     type: number
+ *                   captureId:
+ *                     type: string
+ *                 additionalProperties: false
  *     responses:
  *       200:
- *         description: Click result with optional post-action snapshot.
+ *         description: Click result with optional post-action screenshot and visualCapture metadata. Under the active guard the response also includes an `action` receipt.
  *         content:
  *           application/json:
  *             schema:
  *               type: object
  *       400:
- *         description: Bad request.
+ *         description: Bad request (invalid_coordinates for malformed or out-of-range coordinates).
  *         content:
  *           application/json:
  *             schema:
@@ -3789,7 +3957,19 @@ app.post('/tabs/:tabId/wait', async (req, res) => {
  *             schema:
  *               $ref: '#/components/schemas/Error'
  *       409:
- *         description: Page changed during the click; caller should take a fresh snapshot and retry with current refs.
+ *         description: Page changed or visual capture is stale; retry with a fresh screenshot/snapshot. Under the active guard, failed clicks return guard_click_failed, guard_retry_exhausted, or guard_observation_required.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Blocked by the active links-only navigation guard (code navigation_guard_violation), e.g. doubleClick or a policy-denied click.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       422:
+ *         description: Guard target is not a single visible native hyperlink (code guard_invalid_target).
  *         content:
  *           application/json:
  *             schema:
@@ -3797,27 +3977,75 @@ app.post('/tabs/:tabId/wait', async (req, res) => {
  */
 app.post('/tabs/:tabId/click', async (req, res) => {
   const tabId = req.params.tabId;
+  // Guard lifecycle state lives outside the route try so the catch can include
+  // the receipt and finalize a click that the tab lock rejected first.
+  let guardReceipt = null;
+  let finalizeGuardedClick = null;
   
   try {
-    const { userId, ref, selector } = req.body;
+    const { userId, ref, selector, coordinates } = req.body;
+    const doubleClick = req.body.doubleClick === true;
+    const includeScreenshot = req.body.includeScreenshot === true;
     if (!userId) return res.status(400).json({ error: 'userId required' });
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
     session.lastAccess = Date.now();
     
-    const { tabState } = found;
+    let { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     
-    if (!ref && !selector) {
-      return res.status(400).json({ error: 'ref or selector required' });
+    const hasCoordinates = coordinates !== undefined && coordinates !== null;
+    if (hasCoordinates && (ref || selector)) {
+      throw invalidCoordinatesError('coordinates cannot be combined with ref or selector');
+    }
+    if (!ref && !selector && !hasCoordinates) {
+      return res.status(400).json({ error: 'ref, selector, or coordinates required' });
     }
     const selectorErr = selectorValidationError(selector);
     if (selectorErr) throw invalidSelectorError(selectorErr);
     
+    let coordinateClickPoint = null;
     const result = await withUserLimit(userId, () => withTabLock(tabId, async () => {
       const clickStart = Date.now();
       const remainingBudget = () => Math.max(0, HANDLER_TIMEOUT_MS - 2000 - (Date.now() - clickStart));
+      // Actions and policy must use the SAME live page object. A queued
+      // replacement (proxy rotation / dead-page recovery) swaps the map entry,
+      // so the stale pre-lock capture is never acted on: re-resolve here and
+      // fail if the tab is gone.
+      const liveState = currentTabState(userId, tabId);
+      if (!liveState) throw new Error('Tab destroyed');
+      tabState = liveState;
+      // Early policy shape validation, outside the ledger: a double activation
+      // is refused before any action record exists.
+      if (isNavigationGuardActive(tabState) && doubleClick) {
+        throw guardError('navigation_guard_violation', 'doubleClick is not allowed while the links-only navigation guard is active; the guard permits single native hyperlink clicks only.', 403);
+      }
+      const guardEntry = beginGuardedClick(tabState, { kind: hasCoordinates ? 'coordinates' : (ref ? 'ref' : 'selector') });
+      if (guardEntry) {
+        // One finalizer for this attempt, shared by the success path, the work
+        // catch, and the route catch. completeGuardedClick is idempotent and
+        // guardReceipt prevents double accounting.
+        finalizeGuardedClick = (error = null) => {
+          if (guardReceipt) return guardReceipt;
+          guardReceipt = completeGuardedClick(tabState, guardEntry, error ? { error } : {});
+          return guardReceipt;
+        };
+      }
+      const attachGuardReceipt = (clickResult) => {
+        if (!finalizeGuardedClick) return clickResult;
+        const receipt = finalizeGuardedClick();
+        if (receipt) clickResult.action = receipt;
+        return clickResult;
+      };
+      const guardedClickFailure = (err) => {
+        const code = err && typeof err.code === 'string' ? err.code : null;
+        if (isGuardError(err)) return err;
+        if (code === 'stale_visual_capture' || code === 'stale_refs' || code === 'invalid_coordinates') return err;
+        if (code === 'tab_timeout' || code === 'tab_destroyed' || code === 'page_crashed' || code === 'session_expired') return err;
+        if (isDeadContextError(err) || isPageCrashedError(err) || isTabDestroyedError(err)) return err;
+        return guardError('guard_click_failed', `Guarded click failed: ${safeError(err)}. Take a fresh screenshot/snapshot and retry once with a corrected visible hyperlink target.`, 409);
+      };
       // Full mouse event sequence for stubborn JS click handlers (mirrors Swift WebView.swift)
       // Dispatches: mouseover -> mouseenter -> mousedown -> mouseup -> click
       const dispatchMouseSequence = async (locator) => {
@@ -3861,6 +4089,17 @@ app.post('/tabs/:tabId/click', async (req, res) => {
       
       const doClick = async (locatorOrSelector, isLocator) => {
         let locator = isLocator ? locatorOrSelector : tabState.page.locator(locatorOrSelector);
+        if (guardEntry) {
+          // Links-only mode: no auto-:visible rewrite, no force, no raw mouse
+          // fallback, no replay. Validate the caller's resolved locator, then
+          // dispatch exactly one normal native click. The work catch owns
+          // finalization for any failure here.
+          const target = await inspectGuardedLocator(locator);
+          guardEntry.target = target;
+          guardEntry.dispatchRequested = true;
+          await clickWithDownloadGuard(tabState, () => locator.click({ timeout: 3000 }));
+          return;
+        }
         // CSS selectors supplied by callers can match both the visible menu and
         // inactive template copies. Prefer one visible match when that is
         // unambiguous, while leaving selector lists untouched because appending
@@ -3909,73 +4148,176 @@ app.post('/tabs/:tabId/click', async (req, res) => {
         }
       };
       
-      if (ref) {
-        let locator = refToLocator(tabState.page, ref, tabState.refs);
-        if (!locator) {
-          // Use tight timeout (4s max) to leave budget for click + post-click buildRefs
-          log('info', 'auto-refreshing refs before click', { ref, hadRefs: tabState.refs.size });
-          try {
-            const preClickBudget = Math.min(4000, remainingBudget());
-            tabState.refs = await refreshTabRefs(tabState, { reason: 'pre_click', timeoutMs: preClickBudget });
-          } catch (e) {
-            if (e.message === 'pre_click_refs_timeout' || e.message === 'buildRefs_timeout') {
-              log('warn', 'pre-click buildRefs timed out, proceeding without refresh');
-            } else {
-              throw e;
-            }
+      try {
+        // Readiness/budget gate before any coordinate validation, ref lookup,
+        // or dispatch: a denied attempt never consumes preflight budget.
+        assertGuardedClickReady(tabState);
+
+        if (hasCoordinates) {
+          const { cssX, cssY } = await resolveCoordinatesToCss(tabState, coordinates);
+          coordinateClickPoint = { x: Number(cssX.toFixed(1)), y: Number(cssY.toFixed(1)) };
+          // Invalidate immediately before dispatch: a partial or timed-out click
+          // must not leave this capture reusable.
+          tabState.visualCapture = null;
+          log('info', 'coordinate click', { reqId: req.reqId, tabId, x: cssX.toFixed(0), y: cssY.toFixed(0), doubleClick });
+          if (guardEntry) {
+            // Validate the mapped CSS point before any mouse input; never scroll
+            // or guess. Exactly one native click, no doubleClick. The work catch
+            // owns finalization for any failure here.
+            const target = await inspectGuardedCoordinates(tabState.page, cssX, cssY);
+            guardEntry.target = target;
+            guardEntry.dispatchRequested = true;
+            await clickWithDownloadGuard(tabState, () => withTimeout(
+              tabState.page.mouse.click(cssX, cssY, { clickCount: 1 }),
+              Math.max(1, remainingBudget()),
+              'native coordinate click',
+            ));
+          } else {
+            await clickWithDownloadGuard(tabState, () => withTimeout(
+              tabState.page.mouse.click(cssX, cssY, { clickCount: doubleClick ? 2 : 1 }),
+              Math.max(1, remainingBudget()),
+              'native coordinate click',
+            ));
           }
-          locator = refToLocator(tabState.page, ref, tabState.refs);
+        } else if (ref) {
+          let locator = refToLocator(tabState.page, ref, tabState.refs);
+          // Guarded mode never auto-refreshes or remaps refs: a missing eN must
+          // not silently bind to a different element. The stale-ref error is
+          // recorded in the ledger and returned as-is.
+          if (!locator && !guardEntry) {
+            // Use tight timeout (4s max) to leave budget for click + post-click buildRefs
+            log('info', 'auto-refreshing refs before click', { ref, hadRefs: tabState.refs.size });
+            try {
+              const preClickBudget = Math.min(4000, remainingBudget());
+              tabState.refs = await refreshTabRefs(tabState, { reason: 'pre_click', timeoutMs: preClickBudget });
+            } catch (e) {
+              if (e.message === 'pre_click_refs_timeout' || e.message === 'buildRefs_timeout') {
+                log('warn', 'pre-click buildRefs timed out, proceeding without refresh');
+              } else {
+                throw e;
+              }
+            }
+            locator = refToLocator(tabState.page, ref, tabState.refs);
+          }
+          if (!locator) {
+            const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none';
+            throw new StaleRefsError(ref, maxRef, tabState.refs.size);
+          }
+          // Invalidate immediately before dispatch (see the coordinate branch above).
+          tabState.visualCapture = null;
+          await doClick(locator, true);
+        } else {
+          // Invalidate immediately before dispatch (see the coordinate branch above).
+          tabState.visualCapture = null;
+          await doClick(selector, false);
         }
-        if (!locator) {
-          const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none';
-          throw new StaleRefsError(ref, maxRef, tabState.refs.size);
+        
+        // Attach the post-click viewport screenshot + fresh visualCapture when the
+        // caller asked for it. A capture failure must not fail the completed click.
+        const attachPostClickScreenshot = async (clickResult) => {
+          if (!includeScreenshot) return clickResult;
+          try {
+            const { buffer, visualCapture } = await captureVisualState(tabState);
+            clickResult.screenshot = { data: buffer.toString('base64'), mimeType: 'image/png' };
+            clickResult.visualCapture = visualCapture;
+            // Only a delivered fresh image is an observation; a failed capture
+            // must never clear the guard's observation requirement.
+            noteGuardObservation(tabState);
+          } catch (screenshotErr) {
+            log('warn', 'post-click screenshot failed', { reqId: req.reqId, tabId, error: screenshotErr.message });
+            clickResult.screenshotError = `Post-click screenshot failed: ${safeError(screenshotErr)}`;
+          }
+          return clickResult;
+        };
+        
+        // If clicking on a Google SERP, wait for potential navigation to complete
+        if (onGoogleSerp) {
+          try {
+            await tabState.page.waitForLoadState('domcontentloaded', { timeout: 3000 });
+          } catch {}
+          await tabState.page.waitForTimeout(200);
+          // Skip buildRefs here -- SERP clicks typically navigate to a new page,
+          // and the caller always requests /snapshot next which rebuilds refs.
+          tabState.lastSnapshot = null;
+          tabState.refs = new Map();
+          const newUrl = tabState.page.url();
+          tabState.visitedUrls.add(newUrl);
+          return attachGuardReceipt(await attachPostClickScreenshot({ ok: true, url: newUrl, refsAvailable: false }));
+        } else {
+          await tabState.page.waitForTimeout(500);
         }
-        await doClick(locator, true);
-      } else {
-        await doClick(selector, false);
-      }
-      
-      // If clicking on a Google SERP, wait for potential navigation to complete
-      if (onGoogleSerp) {
-        try {
-          await tabState.page.waitForLoadState('domcontentloaded', { timeout: 3000 });
-        } catch {}
-        await tabState.page.waitForTimeout(200);
-        // Skip buildRefs here -- SERP clicks typically navigate to a new page,
-        // and the caller always requests /snapshot next which rebuilds refs.
         tabState.lastSnapshot = null;
-        tabState.refs = new Map();
+
+        // Coordinate clicks and includeScreenshot callers do not need the
+        // expensive accessibility rebuild; their next observation is the image.
+        // Clear refs so a later ref-based action rebuilds instead of consuming
+        // refs that may predate the click.
+        if (hasCoordinates || includeScreenshot) {
+          tabState.refs = new Map();
+          const newUrl = tabState.page.url();
+          tabState.visitedUrls.add(newUrl);
+          return attachGuardReceipt(await attachPostClickScreenshot({ ok: true, url: newUrl, refsAvailable: false }));
+        }
+
+        // buildRefs after click -- use remaining budget (min 2s) so we don't blow the handler timeout.
+        // If it times out, return without refs (caller's next /snapshot will rebuild them).
+        const postClickBudget = Math.max(2000, remainingBudget());
+        try {
+          tabState.refs = await refreshTabRefs(tabState, { reason: 'post_click', timeoutMs: postClickBudget });
+        } catch (e) {
+          if (e.message === 'post_click_refs_timeout' || e.message === 'buildRefs_timeout') {
+            log('warn', 'post-click buildRefs timed out, returning without refs', { budget: postClickBudget, elapsed: Date.now() - clickStart });
+            tabState.refs = new Map();
+          } else {
+            throw e;
+          }
+        }
+        
         const newUrl = tabState.page.url();
         tabState.visitedUrls.add(newUrl);
-        return { ok: true, url: newUrl, refsAvailable: false };
-      } else {
-        await tabState.page.waitForTimeout(500);
-      }
-      tabState.lastSnapshot = null;
-      // buildRefs after click -- use remaining budget (min 2s) so we don't blow the handler timeout.
-      // If it times out, return without refs (caller's next /snapshot will rebuild them).
-      const postClickBudget = Math.max(2000, remainingBudget());
-      try {
-        tabState.refs = await refreshTabRefs(tabState, { reason: 'post_click', timeoutMs: postClickBudget });
-      } catch (e) {
-        if (e.message === 'post_click_refs_timeout' || e.message === 'buildRefs_timeout') {
-          log('warn', 'post-click buildRefs timed out, returning without refs', { budget: postClickBudget, elapsed: Date.now() - clickStart });
-          tabState.refs = new Map();
-        } else {
-          throw e;
+        return attachGuardReceipt({ ok: true, url: newUrl, refsAvailable: tabState.refs.size > 0 });
+      } catch (err) {
+        // Finalize the admitted attempt exactly once with the actual error, then
+        // surface it: guard errors, pre-dispatch validation codes, and terminal
+        // browser errors are preserved; anything else becomes guard_click_failed.
+        // Unrestricted clicks rethrow the original error untouched.
+        if (guardEntry) {
+          finalizeGuardedClick(err);
+          throw guardedClickFailure(err);
         }
+        throw err;
       }
-      
-      const newUrl = tabState.page.url();
-      tabState.visitedUrls.add(newUrl);
-      return { ok: true, url: newUrl, refsAvailable: tabState.refs.size > 0 };
     }, HANDLER_TIMEOUT_MS, () => destroyTimedOutTab(session, tabId, 'operation_timeout', userId)));
     
     log('info', 'clicked', { reqId: req.reqId, tabId, url: result.url });
-    pluginEvents.emit('tab:click', { userId: req.body.userId, tabId, ref: req.body.ref, selector: req.body.selector });
+    pluginEvents.emit('tab:click', {
+      userId: req.body.userId,
+      tabId,
+      ref: req.body.ref,
+      selector: req.body.selector,
+      ...(coordinateClickPoint ? { coordinates: coordinateClickPoint } : {}),
+    });
     res.json(result);
   } catch (err) {
+    // Finalize an admitted click even when the lock rejected before/around the
+    // inner work. Idempotent with the work catch.
+    if (finalizeGuardedClick && !guardReceipt) {
+      try {
+        guardReceipt = finalizeGuardedClick(err);
+      } catch (finalizeErr) {
+        log('warn', 'guarded click finalize failed', { reqId: req.reqId, tabId, error: finalizeErr.message });
+      }
+    }
+    // Guard policy failures answer directly; never refresh/replay/rotate.
+    if (isGuardError(err)) {
+      return handleRouteError(err, req, res, guardReceipt ? { action: guardReceipt } : {});
+    }
     log('error', 'click failed', { reqId: req.reqId, tabId, error: err.message });
+    // A finalized guarded attempt is never auto-refreshed or replayed; terminal
+    // error handling stays in handleRouteError.
+    if (guardReceipt) {
+      return handleRouteError(err, req, res, { action: guardReceipt });
+    }
     if (err.code !== 'tab_timeout' && err.message?.includes('timed out')) {
       try {
         const session = sessions.get(normalizeUserId(req.body.userId));
@@ -3997,6 +4339,243 @@ app.post('/tabs/:tabId/click', async (req, res) => {
         log('warn', 'post-timeout refresh failed', { error: refreshErr.message });
       }
     }
+    handleRouteError(err, req, res, guardReceipt ? { action: guardReceipt } : {});
+  }
+});
+
+// Navigation guard (opt-in per-tab links-only policy)
+/**
+ * @openapi
+ * /tabs/{tabId}/navigation-guard:
+ *   post:
+ *     tags: [Navigation]
+ *     summary: Start the opt-in links-only navigation guard for a tab
+ *     description: >
+ *       One-way, opt-in per-tab policy. While active, caller-supplied
+ *       JavaScript (evaluate), direct navigation, typing, key presses, form
+ *       selection, uploads, history navigation, refresh, and wait are blocked
+ *       with 403 navigation_guard_violation; only native visible hyperlink
+ *       clicks (ref/selector/coordinates), scrolling, viewport changes,
+ *       screenshots/snapshots, closing, and guard status remain. expectedUrl
+ *       must match the tab's current canonical http(s) URL exactly. Restarting
+ *       with the original start URL is idempotent and never resets the ledger
+ *       or retry budget; a different URL while active returns 409
+ *       guard_start_mismatch. There is no disable/reset action. This is a
+ *       per-tab policy, not a security sandbox: other tabs, new tabs, other
+ *       clients, and session management are out of scope. Requires a server
+ *       running this route.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId, expectedUrl]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               expectedUrl:
+ *                 type: string
+ *                 description: The tab's current canonical http(s) URL; must match exactly.
+ *     responses:
+ *       200:
+ *         description: Guard is active; bounded ledger snapshot plus server-read page identity.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 guard:
+ *                   type: object
+ *                   description: Bounded guard snapshot.
+ *                   properties:
+ *                     mode:
+ *                       type: string
+ *                       enum: [links-only, unrestricted]
+ *                     retryLimit:
+ *                       type: integer
+ *                     actions:
+ *                       type: array
+ *                       items:
+ *                         type: object
+ *                     counters:
+ *                       type: object
+ *                     truncated:
+ *                       type: object
+ *                 page:
+ *                   type: object
+ *                   description: Server-read page identity (static evaluate; not an observation).
+ *                   properties:
+ *                     url:
+ *                       type: string
+ *                     title:
+ *                       type: string
+ *                     h1:
+ *                       type: string
+ *       400:
+ *         description: Missing userId/expectedUrl, or expectedUrl is malformed/non-http(s)/does not match the current URL (navigation_guard_violation).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Blocked by the active guard policy (navigation_guard_violation).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       409:
+ *         description: A guard is already active with a different original start URL (guard_start_mismatch), or the current URL is unavailable.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       410:
+ *         description: Tab was destroyed while the request waited for the tab lock.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       503:
+ *         description: Browser session expired; retry to get a fresh session.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.post('/tabs/:tabId/navigation-guard', async (req, res) => {
+  const tabId = req.params.tabId;
+  try {
+    const { userId, expectedUrl } = req.body || {};
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, tabId);
+    if (!found) return tabNotFoundResponse(res, tabId);
+    session.lastAccess = Date.now();
+
+    const payload = await withUserLimit(userId, () => withTabLock(tabId, async () => {
+      const state = currentTabState(userId, tabId);
+      if (!state) throw new Error('Tab destroyed');
+      // Side effect/validation only: the copy returned by the enable call
+      // would predate the identity read, so the ledger is sampled after it.
+      enableNavigationGuard(state, { tabId, expectedUrl });
+      const page = await readGuardPageIdentity(state.page);
+      return { guard: snapshotNavigationGuard(state), page };
+    }));
+
+    res.json({ ok: true, guard: payload.guard, page: payload.page });
+  } catch (err) {
+    if (isGuardError(err)) return handleRouteError(err, req, res);
+    log('error', 'navigation guard start failed', { reqId: req.reqId, tabId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
+/**
+ * @openapi
+ * /tabs/{tabId}/navigation-guard:
+ *   get:
+ *     tags: [Navigation]
+ *     summary: Get the per-tab navigation guard status and bounded ledger
+ *     description: >
+ *       Read-only status for the opt-in links-only guard. Does not enable,
+ *       disable, or reset the guard; does not count as a fresh observation and
+ *       never resets the retry budget or counters. Returns
+ *       {mode:'unrestricted'} when no guard is active. Requires a server
+ *       running this route.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: userId
+ *         in: query
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Guard snapshot plus server-read page identity.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 guard:
+ *                   type: object
+ *                   description: Bounded guard snapshot (mode, counters, last 100 actions/navigation events, truncation flags).
+ *                 page:
+ *                   type: object
+ *                   description: Server-read page identity (static evaluate; not an observation).
+ *                   properties:
+ *                     url:
+ *                       type: string
+ *                     title:
+ *                       type: string
+ *                     h1:
+ *                       type: string
+ *       400:
+ *         description: userId required.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       410:
+ *         description: Tab was destroyed while the request waited for the tab lock.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       503:
+ *         description: Browser session expired; retry to get a fresh session.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.get('/tabs/:tabId/navigation-guard', async (req, res) => {
+  try {
+    const userId = req.query.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, req.params.tabId);
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    session.lastAccess = Date.now();
+
+    const payload = await withUserLimit(userId, () => withTabLock(req.params.tabId, async () => {
+      const state = currentTabState(userId, req.params.tabId);
+      if (!state) throw new Error('Tab destroyed');
+      const page = await readGuardPageIdentity(state.page);
+      return { guard: snapshotNavigationGuard(state), page };
+    }));
+
+    res.json({ ok: true, guard: payload.guard, page: payload.page });
+  } catch (err) {
+    if (isGuardError(err)) return handleRouteError(err, req, res);
+    log('error', 'navigation guard status failed', { reqId: req.reqId, tabId: req.params.tabId, error: err.message });
     handleRouteError(err, req, res);
   }
 });
@@ -4074,6 +4653,12 @@ const UPLOAD_SETTLE_MS = 1500; // let the page process the upload / render a pre
  *         description: "Bad request (missing path/userId; non-regular file; or a path that is missing or outside the configured upload directory)."
  *       404:
  *         description: "Tab not found."
+ *       403:
+ *         description: Blocked by the active links-only navigation guard (code navigation_guard_violation). File upload is not allowed on a protected tab.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  */
 app.post('/tabs/:tabId/upload', async (req, res) => {
   const tabId = req.params.tabId;
@@ -4086,16 +4671,19 @@ app.post('/tabs/:tabId/upload', async (req, res) => {
     if (!userId) return res.status(400).json({ error: 'userId required' });
     if (!filePath) return res.status(400).json({ error: 'path required (container-side file path)' });
 
-    const paths = await resolveUploadPaths({ uploadsDir: CONFIG.uploadsDir, filePaths: Array.isArray(filePath) ? filePath : [filePath] });
-
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    // Opt-in guard: upload is blocked before any upload resource is resolved.
+    assertNavigationActionAllowed(found.tabState, 'upload');
     session.lastAccess = Date.now();
-    const { tabState } = found;
+    let { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
 
+    let paths = null;
     const result = await withUserLimit(userId, () => withTabLock(tabId, async () => {
+      tabState = assertCurrentTabActionAllowed(userId, tabId, 'upload');
+      paths = await resolveUploadPaths({ uploadsDir: CONFIG.uploadsDir, filePaths: Array.isArray(filePath) ? filePath : [filePath] });
       const directInput = tabState.page.locator('input[type="file"]').first();
       let attachedVia = null;
 
@@ -4215,6 +4803,7 @@ app.post('/tabs/:tabId/upload', async (req, res) => {
     pluginEvents.emit('tab:upload', { userId, tabId, paths });
     res.json(result);
   } catch (err) {
+    if (isGuardError(err)) return handleRouteError(err, req, res);
     log('error', 'upload failed', { reqId: req.reqId, tabId, error: err.message });
     handleRouteError(err, req, res);
   }
@@ -4281,6 +4870,12 @@ app.post('/tabs/:tabId/upload', async (req, res) => {
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Blocked by the active links-only navigation guard (code navigation_guard_violation). Typing is not allowed on a protected tab.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  */
 app.post('/tabs/:tabId/type', async (req, res) => {
   const tabId = req.params.tabId;
@@ -4290,10 +4885,14 @@ app.post('/tabs/:tabId/type', async (req, res) => {
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    // Opt-in guard: typing is blocked before any capture invalidation or input.
+    assertNavigationActionAllowed(found.tabState, 'type');
     session.lastAccess = Date.now();
     
-    const { tabState } = found;
+    let { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+    // Typing can reflow the page; a pre-typing capture must not be reused.
+    tabState.visualCapture = null;
     
     if (mode !== 'fill' && mode !== 'keyboard') {
       return res.status(400).json({ error: "mode must be 'fill' or 'keyboard'" });
@@ -4310,6 +4909,7 @@ app.post('/tabs/:tabId/type', async (req, res) => {
     const shouldSubmit = submit || pressEnter;
     
     await withTabLock(tabId, async () => {
+      tabState = assertCurrentTabActionAllowed(userId, tabId, 'type');
       // Resolve and focus the target if ref/selector provided
       let locator = null;
       if (ref) {
@@ -4343,6 +4943,7 @@ app.post('/tabs/:tabId/type', async (req, res) => {
     pluginEvents.emit('tab:type', typeEventPayload({ userId: req.body.userId, tabId, text: req.body.text, ref: req.body.ref, mode: req.body.mode }));
     res.json({ ok: true });
   } catch (err) {
+    if (isGuardError(err)) return handleRouteError(err, req, res);
     log('error', 'type failed', { reqId: req.reqId, error: err.message });
     if (err.message?.includes('timed out') || err.message?.includes('not an <input>')) {
       try {
@@ -4417,6 +5018,12 @@ app.post('/tabs/:tabId/type', async (req, res) => {
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Blocked by the active links-only navigation guard (code navigation_guard_violation). Native form selection is not allowed on a protected tab.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  */
 // Select a native form option by its visible label or HTML value.
 app.post('/tabs/:tabId/select', async (req, res) => {
@@ -4426,15 +5033,18 @@ app.post('/tabs/:tabId/select', async (req, res) => {
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    // Opt-in guard: native form selection is blocked while protected.
+    assertNavigationActionAllowed(found.tabState, 'select');
     if ((!ref && !selector) || typeof option !== 'string' || !option) {
       return res.status(400).json({ error: 'ref or selector and a nonempty option are required' });
     }
     const selectorErr = selectorValidationError(selector);
     if (selectorErr) throw invalidSelectorError(selectorErr);
     session.lastAccess = Date.now();
-    const { tabState } = found;
+    let { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     await withTabLock(tabId, async () => {
+      tabState = assertCurrentTabActionAllowed(userId, tabId, 'select');
       let locator = ref ? refToLocator(tabState.page, ref, tabState.refs) : tabState.page.locator(selector);
       if (!locator && ref) {
         tabState.refs = await refreshTabRefs(tabState, { reason: 'select' });
@@ -4451,6 +5061,7 @@ app.post('/tabs/:tabId/select', async (req, res) => {
     pluginEvents.emit('tab:select', { userId, tabId, ref, option });
     res.json({ ok: true });
   } catch (err) {
+    if (isGuardError(err)) return handleRouteError(err, req, res);
     log('error', 'select failed', { reqId: req.reqId, error: err.message });
     handleRouteError(err, req, res);
   }
@@ -4498,6 +5109,12 @@ app.post('/tabs/:tabId/select', async (req, res) => {
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Blocked by the active links-only navigation guard (code navigation_guard_violation). Key presses are not allowed on a protected tab.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  */
 app.post('/tabs/:tabId/press', async (req, res) => {
   const tabId = req.params.tabId;
@@ -4507,19 +5124,23 @@ app.post('/tabs/:tabId/press', async (req, res) => {
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    // Opt-in guard: keyboard input is blocked while protected.
+    assertNavigationActionAllowed(found.tabState, 'press');
     session.lastAccess = Date.now();
     
-    const { tabState } = found;
+    let { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     const normalizedKey = normalizeBrowserKey(key);
     
     await withTabLock(tabId, async () => {
+      tabState = assertCurrentTabActionAllowed(userId, tabId, 'press');
       await tabState.page.keyboard.press(normalizedKey);
     });
     
     pluginEvents.emit('tab:press', { userId, tabId, key: normalizedKey });
     res.json({ ok: true });
   } catch (err) {
+    if (isGuardError(err)) return handleRouteError(err, req, res);
     log('error', 'press failed', { reqId: req.reqId, error: err.message });
     handleRouteError(err, req, res);
   }
@@ -4581,6 +5202,9 @@ app.post('/tabs/:tabId/scroll', async (req, res) => {
     
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+    // Scrolling invalidates any screenshot capture (its scroll offset no longer
+    // matches the live viewport).
+    tabState.visualCapture = null;
     
     await withTabLock(req.params.tabId, async () => {
       const isVertical = direction === 'up' || direction === 'down';
@@ -4668,6 +5292,9 @@ app.post('/tabs/:tabId/viewport', async (req, res) => {
 
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+    // A viewport resize invalidates any screenshot capture (image pixels map to
+    // a different CSS viewport now).
+    tabState.visualCapture = null;
 
     await tabState.page.setViewportSize({ width: Math.round(width), height: Math.round(height) });
     await tabState.page.waitForTimeout(150);
@@ -4721,6 +5348,12 @@ app.post('/tabs/:tabId/viewport', async (req, res) => {
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Blocked by the active links-only navigation guard (code navigation_guard_violation). History navigation is not allowed on a protected tab.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  */
 app.post('/tabs/:tabId/back', async (req, res) => {
   const tabId = req.params.tabId;
@@ -4730,12 +5363,15 @@ app.post('/tabs/:tabId/back', async (req, res) => {
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    // Opt-in guard: history navigation is blocked while protected.
+    assertNavigationActionAllowed(found.tabState, 'back');
     session.lastAccess = Date.now();
     
-    const { tabState } = found;
+    let { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     
     const result = await withTabLock(tabId, async () => {
+      tabState = assertCurrentTabActionAllowed(userId, tabId, 'back');
       try {
         await tabState.page.goBack({ timeout: 20000 });
       } catch (navErr) {
@@ -4753,6 +5389,7 @@ app.post('/tabs/:tabId/back', async (req, res) => {
     
     res.json(result);
   } catch (err) {
+    if (isGuardError(err)) return handleRouteError(err, req, res);
     log('error', 'back failed', { reqId: req.reqId, error: err.message });
     handleRouteError(err, req, res);
   }
@@ -4799,6 +5436,12 @@ app.post('/tabs/:tabId/back', async (req, res) => {
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Blocked by the active links-only navigation guard (code navigation_guard_violation). History navigation is not allowed on a protected tab.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  */
 app.post('/tabs/:tabId/forward', async (req, res) => {
   const tabId = req.params.tabId;
@@ -4808,12 +5451,15 @@ app.post('/tabs/:tabId/forward', async (req, res) => {
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    // Opt-in guard: history navigation is blocked while protected.
+    assertNavigationActionAllowed(found.tabState, 'forward');
     session.lastAccess = Date.now();
     
-    const { tabState } = found;
+    let { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     
     const result = await withTabLock(tabId, async () => {
+      tabState = assertCurrentTabActionAllowed(userId, tabId, 'forward');
       await tabState.page.goForward({ timeout: 10000 });
       tabState.refs = await buildRefs(tabState.page);
       return { ok: true, url: tabState.page.url() };
@@ -4821,6 +5467,7 @@ app.post('/tabs/:tabId/forward', async (req, res) => {
     
     res.json(result);
   } catch (err) {
+    if (isGuardError(err)) return handleRouteError(err, req, res);
     log('error', 'forward failed', { reqId: req.reqId, error: err.message });
     handleRouteError(err, req, res);
   }
@@ -4867,6 +5514,12 @@ app.post('/tabs/:tabId/forward', async (req, res) => {
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Blocked by the active links-only navigation guard (code navigation_guard_violation). Refresh is not allowed on a protected tab.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  */
 app.post('/tabs/:tabId/refresh', async (req, res) => {
   const tabId = req.params.tabId;
@@ -4876,12 +5529,15 @@ app.post('/tabs/:tabId/refresh', async (req, res) => {
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    // Opt-in guard: refresh is blocked while protected.
+    assertNavigationActionAllowed(found.tabState, 'refresh');
     session.lastAccess = Date.now();
     
-    const { tabState } = found;
+    let { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     
     const result = await withTabLock(tabId, async () => {
+      tabState = assertCurrentTabActionAllowed(userId, tabId, 'refresh');
       await tabState.page.reload({ timeout: 30000 });
       tabState.refs = await buildRefs(tabState.page);
       return { ok: true, url: tabState.page.url() };
@@ -4889,6 +5545,7 @@ app.post('/tabs/:tabId/refresh', async (req, res) => {
     
     res.json(result);
   } catch (err) {
+    if (isGuardError(err)) return handleRouteError(err, req, res);
     log('error', 'refresh failed', { reqId: req.reqId, error: err.message });
     handleRouteError(err, req, res);
   }
@@ -5135,7 +5792,12 @@ app.get('/tabs/:tabId/images', async (req, res) => {
  *   get:
  *     tags: [Content]
  *     summary: Take a screenshot
- *     description: Returns a base64-encoded PNG screenshot.
+ *     description: >
+ *       Returns a raw PNG. By default the screenshot is viewport-only and the
+ *       response carries an X-Camofox-Visual-Metadata header (base64url-encoded
+ *       UTF-8 JSON) with the visualCapture metadata used by coordinate clicks.
+ *       fullPage=true returns the legacy full-page PNG without metadata and
+ *       invalidates any existing viewport capture.
  *     parameters:
  *       - name: tabId
  *         in: path
@@ -5147,21 +5809,25 @@ app.get('/tabs/:tabId/images', async (req, res) => {
  *         required: true
  *         schema:
  *           type: string
+ *       - name: fullPage
+ *         in: query
+ *         required: false
+ *         schema:
+ *           type: boolean
+ *         description: Return a full-page PNG instead of a viewport capture; no visualCapture metadata is produced.
  *     responses:
  *       200:
- *         description: Screenshot.
- *         content:
- *           application/json:
+ *         description: Raw PNG screenshot. Viewport captures include the X-Camofox-Visual-Metadata header; fullPage=true does not.
+ *         headers:
+ *           X-Camofox-Visual-Metadata:
+ *             description: base64url-encoded UTF-8 JSON visualCapture metadata for viewport captures.
  *             schema:
- *               type: object
- *               properties:
- *                 screenshot:
- *                   type: object
- *                   properties:
- *                     data:
- *                       type: string
- *                     mimeType:
- *                       type: string
+ *               type: string
+ *         content:
+ *           image/png:
+ *             schema:
+ *               type: string
+ *               format: binary
  *       404:
  *         description: Tab not found.
  *         content:
@@ -5179,9 +5845,30 @@ app.get('/tabs/:tabId/screenshot', async (req, res) => {
     session.lastAccess = Date.now();
     
     const { tabState } = found;
-    const buffer = await tabState.page.screenshot({ type: 'png', fullPage });
+    if (fullPage) {
+      // Full-page screenshots are not valid coordinate captures (image pixels do
+      // not map to the viewport); invalidate any older viewport capture and keep
+      // the legacy raw-PNG response for them. Run under the tab lock so a
+      // full-page shot cannot overlap a coordinate click or viewport capture.
+      const buffer = await withTabLock(req.params.tabId, async () => {
+        tabState.visualCapture = null;
+        return tabState.page.screenshot({ type: 'png', fullPage: true });
+      });
+      // A delivered fresh full-page PNG is a model observation (it produces no
+      // coordinate-capture metadata but still satisfies the guard's gate).
+      noteGuardObservation(tabState);
+      pluginEvents.emit('tab:screenshot', { userId, tabId: req.params.tabId, buffer });
+      res.set('Content-Type', 'image/png');
+      return res.send(buffer);
+    }
+    // Serialize the capture with the per-tab lock; the stored capture is the only
+    // one coordinate clicks may reference.
+    const { buffer, visualCapture } = await withTabLock(req.params.tabId, () => captureVisualState(tabState));
+    // Only a delivered fresh capture counts; a failed capture throws above.
+    noteGuardObservation(tabState);
     pluginEvents.emit('tab:screenshot', { userId, tabId: req.params.tabId, buffer });
     res.set('Content-Type', 'image/png');
+    res.set('X-Camofox-Visual-Metadata', Buffer.from(JSON.stringify(visualCapture), 'utf8').toString('base64url'));
     res.send(buffer);
   } catch (err) {
     log('error', 'screenshot failed', { reqId: req.reqId, error: err.message });
@@ -5324,6 +6011,12 @@ app.get('/tabs/:tabId/stats', async (req, res) => {
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Blocked by the active links-only navigation guard (code navigation_guard_violation). Caller-supplied JavaScript is blocked outright on a protected tab; use snapshot, screenshot, or guard status instead.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  */
 app.post('/tabs/:tabId/evaluate', express.json({ limit: CONFIG.evaluateMaxBodySize }), async (req, res) => {
   try {
@@ -5335,14 +6028,21 @@ app.post('/tabs/:tabId/evaluate', express.json({ limit: CONFIG.evaluateMaxBodySi
     const found = session && findTab(session, req.params.tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
 
+    // Opt-in guard: caller-supplied JavaScript is blocked outright while protected.
+    assertNavigationActionAllowed(found.tabState, 'evaluate');
     session.lastAccess = Date.now();
-    const { tabState } = found;
+    let { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
 
-    pluginEvents.emit('tab:evaluate', { userId, tabId: req.params.tabId, expression });
     const result = await withUserLimit(userId, () => withTabLock(
       req.params.tabId,
-      () => tabState.page.evaluate(expression),
+      async () => {
+        // Re-resolve inside the lock: an activation while queued must not emit
+        // the caller expression or evaluate it.
+        tabState = assertCurrentTabActionAllowed(userId, req.params.tabId, 'evaluate');
+        pluginEvents.emit('tab:evaluate', { userId, tabId: req.params.tabId, expression });
+        return tabState.page.evaluate(expression);
+      },
       requestTimeoutMs(),
       () => destroyTimedOutTab(session, req.params.tabId, 'operation_timeout', userId),
     ));
@@ -5350,6 +6050,7 @@ app.post('/tabs/:tabId/evaluate', express.json({ limit: CONFIG.evaluateMaxBodySi
     log('info', 'evaluate', { reqId: req.reqId, tabId: req.params.tabId, userId, resultType: typeof result });
     res.json({ ok: true, result });
   } catch (err) {
+    if (isGuardError(err)) return handleRouteError(err, req, res);
     log('error', 'evaluate failed', { reqId: req.reqId, tabId: req.params.tabId, error: err.message });
     handleRouteError(err, req, res);
   }
@@ -6256,7 +6957,7 @@ app.post('/tabs/open', async (req, res) => {
     attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
     group.set(tabId, tabState);
     releasePageLease(session, lease);
-    attachPopupHandler(page, userId, listItemId);
+    attachPopupHandler(page, userId, listItemId, tabState);
     refreshActiveTabsGauge();
     
     try {
@@ -6276,11 +6977,13 @@ app.post('/tabs/open', async (req, res) => {
         session = await getSession(userId);
         group = getTabGroup(session, listItemId);
         ({ page, lease } = await createLeasedPage(session));
+        const previousTabState = tabState;
         tabState = createTabState(page);
+        transferNavigationGuard(previousTabState, tabState);
         attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
         group.set(tabId, tabState);
         releasePageLease(session, lease);
-        attachPopupHandler(page, userId, listItemId);
+        attachPopupHandler(page, userId, listItemId, tabState);
         refreshActiveTabsGauge();
         await withPageLoadDuration('open_url', () => navigatePage(page, url));
         recordNavSuccess(userId);
@@ -6431,6 +7134,12 @@ app.post('/stop', async (req, res) => {
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Blocked by the active links-only navigation guard (code navigation_guard_violation). Legacy direct navigation is blocked on a protected tab.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  */
 app.post('/navigate', async (req, res) => {
   try {
@@ -6451,10 +7160,13 @@ app.post('/navigate', async (req, res) => {
       return tabNotFoundResponse(res, req.params.tabId || targetId);
     }
     
-    const { tabState } = found;
+    // Opt-in guard: legacy direct navigation is blocked while protected.
+    assertNavigationActionAllowed(found.tabState, 'navigate');
+    let { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     
     const result = await withTabLock(targetId, async () => {
+      tabState = assertCurrentTabActionAllowed(userId, targetId, 'navigate');
       await withPageLoadDuration('navigate', () => navigatePage(tabState.page, url));
       recordNavSuccess(userId);
       tabState.visitedUrls.add(url);
@@ -6472,6 +7184,7 @@ app.post('/navigate', async (req, res) => {
     
     res.json(result);
   } catch (err) {
+    if (isGuardError(err)) return handleRouteError(err, req, res);
     log('error', 'openclaw navigate failed', { reqId: req.reqId, error: err.message });
     if (recordNavFailure(req.body?.userId)) {
       await recoverUserSession(req.body.userId, 'openclaw_navigate_failure');
@@ -6699,6 +7412,12 @@ app.get('/snapshot', async (req, res) => {
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Blocked by the active links-only navigation guard (code navigation_guard_violation). The entire legacy /act surface is blocked on a protected tab; use the canonical guarded click/scroll routes instead.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  */
 app.post('/act', async (req, res) => {
   try {
@@ -6717,10 +7436,21 @@ app.post('/act', async (req, res) => {
       return tabNotFoundResponse(res, req.params.tabId || targetId);
     }
     
-    const { tabState } = found;
+    // Opt-in guard: the entire legacy /act surface is blocked while protected;
+    // active clients must use the canonical guarded click/scroll routes.
+    assertNavigationActionAllowed(found.tabState, 'legacy_act');
+    let { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     
     const result = await withTabLock(targetId, async () => {
+      tabState = assertCurrentTabActionAllowed(userId, targetId, 'legacy_act');
+      // Legacy /act input actions share this tab's state with the coordinate
+      // routes; invalidate any screenshot capture before they can mutate the
+      // rendered page (wait is read-only; close removes the tab).
+      if (kind === 'click' || kind === 'type' || kind === 'press' ||
+          kind === 'scroll' || kind === 'scrollIntoView' || kind === 'hover') {
+        tabState.visualCapture = null;
+      }
       switch (kind) {
         case 'click': {
           const { ref, selector, doubleClick } = params;
@@ -6874,6 +7604,7 @@ app.post('/act', async (req, res) => {
     
     res.json(result);
   } catch (err) {
+    if (isGuardError(err)) return handleRouteError(err, req, res);
     log('error', 'act failed', { reqId: req.reqId, kind: req.body?.kind, error: err.message });
     handleRouteError(err, req, res);
   }
