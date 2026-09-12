@@ -88,12 +88,15 @@ afterEach(() => {
 
 // --- Schema sanity ----------------------------------------------------------
 describe('TOOL_DEFS', () => {
-  test('exposes exactly 12 tools in stable order', () => {
-    expect(TOOL_DEFS).toHaveLength(12);
+  test('exposes exactly 15 tools in stable order', () => {
+    expect(TOOL_DEFS).toHaveLength(15);
     expect(TOOL_NAMES).toEqual([
       'camofox_create_tab',
       'camofox_snapshot',
       'camofox_click',
+      'camofox_hold',
+      'camofox_drag',
+      'camofox_hover',
       'camofox_type',
       'camofox_navigate',
       'camofox_scroll',
@@ -123,7 +126,43 @@ describe('TOOL_DEFS', () => {
     expect(coordinates.additionalProperties).toBe(false);
     expect(Object.keys(coordinates.properties).sort()).toEqual(['captureId', 'x', 'y']);
     expect(click.inputSchema.properties.doubleClick.type).toBe('boolean');
+    expect(click.inputSchema.properties.button.enum).toEqual(['left', 'right', 'middle']);
     expect(click.inputSchema.properties.includeScreenshot.type).toBe('boolean');
+  });
+
+  test('camofox_hold schema exposes strict coordinates, durationMs, humanize, includeScreenshot', () => {
+    const hold = TOOL_DEFS.find((t) => t.name === 'camofox_hold');
+    const coordinates = hold.inputSchema.properties.coordinates;
+    expect(coordinates.type).toBe('object');
+    expect(coordinates.required).toEqual(['x', 'y', 'captureId']);
+    expect(coordinates.additionalProperties).toBe(false);
+    expect(Object.keys(coordinates.properties).sort()).toEqual(['captureId', 'x', 'y']);
+    expect(hold.inputSchema.properties.durationMs.type).toBe('number');
+    expect(hold.inputSchema.properties.humanize.type).toBe('boolean');
+    expect(hold.inputSchema.properties.includeScreenshot.type).toBe('boolean');
+  });
+
+  test('camofox_drag and camofox_hover schemas expose strict nested targets and options', () => {
+    const drag = TOOL_DEFS.find((t) => t.name === 'camofox_drag');
+    expect(drag.inputSchema.required).toEqual(['tabId', 'source', 'target']);
+    for (const side of ['source', 'target']) {
+      const spec = drag.inputSchema.properties[side];
+      expect(spec.type).toBe('object');
+      expect(spec.additionalProperties).toBe(false);
+      expect(spec.properties.coordinates.required).toEqual(['x', 'y', 'captureId']);
+      expect(spec.properties.coordinates.additionalProperties).toBe(false);
+    }
+    expect(drag.inputSchema.properties.steps.type).toBe('number');
+    expect(drag.inputSchema.properties.holdBeforeDropMs.type).toBe('number');
+    expect(drag.inputSchema.properties.humanize.type).toBe('boolean');
+    expect(drag.inputSchema.properties.includeScreenshot.type).toBe('boolean');
+
+    const hover = TOOL_DEFS.find((t) => t.name === 'camofox_hover');
+    expect(hover.inputSchema.properties.coordinates.required).toEqual(['x', 'y', 'captureId']);
+    expect(hover.inputSchema.properties.coordinates.additionalProperties).toBe(false);
+    expect(hover.inputSchema.properties.settleMs.type).toBe('number');
+    expect(hover.inputSchema.properties.humanize.type).toBe('boolean');
+    expect(hover.inputSchema.properties.includeScreenshot.type).toBe('boolean');
   });
 });
 
@@ -134,6 +173,9 @@ describe('buildRequest', () => {
     ['camofox_snapshot', { tabId: 't1' }, { method: 'GET', path: '/tabs/t1/snapshot?userId=u1&includeScreenshot=true', auth: 'accessKey', kind: 'snapshot' }],
     ['camofox_snapshot', { tabId: 't1', offset: 40 }, { method: 'GET', path: '/tabs/t1/snapshot?userId=u1&includeScreenshot=true&offset=40', auth: 'accessKey', kind: 'snapshot' }],
     ['camofox_click', { tabId: 't1', ref: 'e1' }, { method: 'POST', path: '/tabs/t1/click', auth: 'accessKey', kind: 'json' }],
+    ['camofox_hold', { tabId: 't1', ref: 'e1' }, { method: 'POST', path: '/tabs/t1/hold', auth: 'accessKey', kind: 'json' }],
+    ['camofox_drag', { tabId: 't1', source: { ref: 'e1' }, target: { ref: 'e2' } }, { method: 'POST', path: '/tabs/t1/drag', auth: 'accessKey', kind: 'json' }],
+    ['camofox_hover', { tabId: 't1', ref: 'e1' }, { method: 'POST', path: '/tabs/t1/hover', auth: 'accessKey', kind: 'json' }],
     ['camofox_type', { tabId: 't1', text: 'hi', pressEnter: true }, { method: 'POST', path: '/tabs/t1/type', auth: 'accessKey', kind: 'json' }],
     ['camofox_navigate', { tabId: 't1', url: 'https://y.com' }, { method: 'POST', path: '/tabs/t1/navigate', auth: 'accessKey', kind: 'json' }],
     ['camofox_scroll', { tabId: 't1', direction: 'down', amount: 200 }, { method: 'POST', path: '/tabs/t1/scroll', auth: 'accessKey', kind: 'json' }],
@@ -190,6 +232,59 @@ describe('buildRequest', () => {
     const spec = buildRequest('camofox_click', { tabId: 't1', ref: 'e1' }, CTX);
     expect(spec.responseKind).toBe('json');
     expect(spec.body).toEqual({ ref: 'e1', userId: 'u1' });
+  });
+
+  test('hold forwards durationMs/humanize and strict booleans without tabId', () => {
+    const spec = buildRequest('camofox_hold', {
+      tabId: 't1',
+      selector: 'button',
+      durationMs: 12000,
+      humanize: false,
+      includeScreenshot: true,
+    }, CTX);
+    expect(spec.method).toBe('POST');
+    expect(spec.path).toBe('/tabs/t1/hold');
+    expect(spec.responseKind).toBe('snapshot');
+    expect(spec.body).toEqual({
+      selector: 'button',
+      durationMs: 12000,
+      humanize: false,
+      includeScreenshot: true,
+      userId: 'u1',
+    });
+    expect(spec.body.tabId).toBeUndefined();
+  });
+
+  test('drag forwards nested source/target and hover forwards settleMs without tabId', () => {
+    const dragSpec = buildRequest('camofox_drag', {
+      tabId: 't1',
+      source: { selector: '#a' },
+      target: { coordinates: { x: 1, y: 2, captureId: 'cap-1' } },
+      steps: 12,
+      holdBeforeDropMs: 150,
+      humanize: false,
+      includeScreenshot: true,
+    }, CTX);
+    expect(dragSpec.method).toBe('POST');
+    expect(dragSpec.path).toBe('/tabs/t1/drag');
+    expect(dragSpec.responseKind).toBe('snapshot');
+    expect(dragSpec.body).toEqual({
+      source: { selector: '#a' },
+      target: { coordinates: { x: 1, y: 2, captureId: 'cap-1' } },
+      steps: 12,
+      holdBeforeDropMs: 150,
+      humanize: false,
+      includeScreenshot: true,
+      userId: 'u1',
+    });
+    expect(dragSpec.body.tabId).toBeUndefined();
+
+    const hoverSpec = buildRequest('camofox_hover', { tabId: 't1', selector: '#b', settleMs: 500 }, CTX);
+    expect(hoverSpec.method).toBe('POST');
+    expect(hoverSpec.path).toBe('/tabs/t1/hover');
+    expect(hoverSpec.responseKind).toBe('json');
+    expect(hoverSpec.body).toEqual({ selector: '#b', settleMs: 500, userId: 'u1' });
+    expect(hoverSpec.body.tabId).toBeUndefined();
   });
 
   test('includeScreenshot must be strictly true to select the snapshot adapter', () => {

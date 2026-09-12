@@ -64,7 +64,7 @@ const SEARCH_MACROS = [
 ];
 
 /**
- * The 12 tools, identical schema for both hosts. Edit here and both update.
+ * The 15 tools, identical schema for both hosts. Edit here and both update.
  * @type {ToolDef[]}
  */
 export const TOOL_DEFS = [
@@ -125,11 +125,171 @@ export const TOOL_DEFS = [
           required: ['x', 'y', 'captureId'],
           additionalProperties: false,
         },
-        doubleClick: { type: 'boolean', description: 'Double-click at the coordinates (only used with coordinates).' },
+        doubleClick: { type: 'boolean', description: 'Double-click (coordinates, ref, or selector). Refused while the links-only navigation guard is active.' },
+        button: {
+          type: 'string',
+          enum: ['left', 'right', 'middle'],
+          description: 'Mouse button (default left). Non-left buttons are refused while the links-only navigation guard is active.',
+        },
         includeScreenshot: {
           type: 'boolean',
           description:
             'Return a post-click viewport screenshot plus visualCapture metadata instead of rebuilding element refs (refsAvailable=false).',
+        },
+      },
+      required: ['tabId'],
+    },
+  },
+  {
+    name: 'camofox_hold',
+    description:
+      'Press and hold (long-press) a target in a Camoufox tab by element ref (e.g., e1), CSS selector, or image-pixel coordinates from the latest viewport screenshot ' +
+      '(same coordinate contract as camofox_click: call camofox_screenshot first and pass {x, y, captureId}). ' +
+      'Dispatches one trusted native mouse-down, keeps it pressed for durationMs (default 3000, max 20000) while emitting small humanized micro-movements, then releases. ' +
+      'Use for "press and hold" human-verification widgets (e.g. PerimeterX captchas): hold the button for ~10000-15000ms, then wait ~10-15s and screenshot again to check the result (the challenge can clear asynchronously after release). ' +
+      'Coordinates cannot be combined with ref or selector.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string', description: 'Tab identifier' },
+        ref: { type: 'string', description: 'Element ref from snapshot (e.g., e1)' },
+        selector: { type: 'string', description: 'CSS selector (alternative to ref)' },
+        coordinates: {
+          type: 'object',
+          description:
+            'Image-pixel coordinates in the latest standalone screenshot (camofox_screenshot, or the screenshot returned by a click/hold with includeScreenshot:true). ' +
+            'x/y are pixels in that PNG image (not CSS pixels); captureId must be its visualCapture.captureId. Mutually exclusive with ref/selector.',
+          properties: {
+            x: { type: 'number', description: 'X pixel in the captured screenshot image (0 = left edge).' },
+            y: { type: 'number', description: 'Y pixel in the captured screenshot image (0 = top edge).' },
+            captureId: { type: 'string', description: 'captureId from the screenshot visualCapture metadata (required).' },
+          },
+          required: ['x', 'y', 'captureId'],
+          additionalProperties: false,
+        },
+        durationMs: {
+          type: 'number',
+          description: 'Hold duration in milliseconds (100..20000; default 3000). Use ~10000-15000 for press-and-hold captchas.',
+        },
+        humanize: {
+          type: 'boolean',
+          description: 'Humanized approach path plus micro-movements during the hold (default true).',
+        },
+        includeScreenshot: {
+          type: 'boolean',
+          description:
+            'Return a post-hold viewport screenshot plus visualCapture metadata instead of rebuilding element refs (refsAvailable=false).',
+        },
+      },
+      required: ['tabId'],
+    },
+  },
+  {
+    name: 'camofox_drag',
+    description:
+      'Drag and drop in a Camoufox tab from a source to a target (each an element ref, CSS selector, or image-pixel coordinates {x, y, captureId} from the latest viewport screenshot). ' +
+      'Presses the primary button at the source center, moves along a humanized jittered path to the target center, dwells briefly, then releases. ' +
+      'Works for mouse-event drag implementations and HTML5 draggable elements. Coordinates for both endpoints use the same screenshot captureId. ' +
+      'Ref/selector endpoints are scrolled into view first; both endpoints must be inside the viewport when the drag starts. ' +
+      'Blocked while the links-only navigation guard is active.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string', description: 'Tab identifier' },
+        source: {
+          type: 'object',
+          description: 'Drag source: exactly one of ref, selector, or coordinates.',
+          properties: {
+            ref: { type: 'string', description: 'Element ref from snapshot (e.g., e1)' },
+            selector: { type: 'string', description: 'CSS selector (alternative to ref)' },
+            coordinates: {
+              type: 'object',
+              properties: {
+                x: { type: 'number', description: 'X pixel in the captured screenshot image.' },
+                y: { type: 'number', description: 'Y pixel in the captured screenshot image.' },
+                captureId: { type: 'string', description: 'captureId from the screenshot visualCapture metadata.' },
+              },
+              required: ['x', 'y', 'captureId'],
+              additionalProperties: false,
+            },
+          },
+          additionalProperties: false,
+        },
+        target: {
+          type: 'object',
+          description: 'Drop target: exactly one of ref, selector, or coordinates.',
+          properties: {
+            ref: { type: 'string', description: 'Element ref from snapshot (e.g., e2)' },
+            selector: { type: 'string', description: 'CSS selector (alternative to ref)' },
+            coordinates: {
+              type: 'object',
+              properties: {
+                x: { type: 'number', description: 'X pixel in the captured screenshot image.' },
+                y: { type: 'number', description: 'Y pixel in the captured screenshot image.' },
+                captureId: { type: 'string', description: 'captureId from the screenshot visualCapture metadata.' },
+              },
+              required: ['x', 'y', 'captureId'],
+              additionalProperties: false,
+            },
+          },
+          additionalProperties: false,
+        },
+        steps: {
+          type: 'number',
+          description: 'Intermediate mousemove dispatches along the path (1..60; default humanized 10..20).',
+        },
+        holdBeforeDropMs: {
+          type: 'number',
+          description: 'Dwell over the target before releasing (0..5000; default humanized 80..250, 0 when humanize=false).',
+        },
+        humanize: {
+          type: 'boolean',
+          description: 'Humanized approach and jittered path (default true).',
+        },
+        includeScreenshot: {
+          type: 'boolean',
+          description: 'Return a post-drag viewport screenshot plus visualCapture metadata (refsAvailable=false).',
+        },
+      },
+      required: ['tabId', 'source', 'target'],
+    },
+  },
+  {
+    name: 'camofox_hover',
+    description:
+      'Move the native mouse over a target in a Camoufox tab (element ref, CSS selector, or image-pixel coordinates {x, y, captureId} from the latest viewport screenshot) ' +
+      'with a humanized approach, then dwell for settleMs so hover menus/tooltips can open. ' +
+      'Ref/selector targets are scrolled into view first. ' +
+      'Blocked while the links-only navigation guard is active.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'string', description: 'Tab identifier' },
+        ref: { type: 'string', description: 'Element ref from snapshot (e.g., e1)' },
+        selector: { type: 'string', description: 'CSS selector (alternative to ref)' },
+        coordinates: {
+          type: 'object',
+          description:
+            'Image-pixel coordinates in the latest standalone screenshot (camofox_screenshot). x/y are pixels in that PNG image; captureId must be its visualCapture.captureId. Mutually exclusive with ref/selector.',
+          properties: {
+            x: { type: 'number', description: 'X pixel in the captured screenshot image.' },
+            y: { type: 'number', description: 'Y pixel in the captured screenshot image.' },
+            captureId: { type: 'string', description: 'captureId from the screenshot visualCapture metadata.' },
+          },
+          required: ['x', 'y', 'captureId'],
+          additionalProperties: false,
+        },
+        settleMs: {
+          type: 'number',
+          description: 'Dwell time after the move (0..5000; default 300).',
+        },
+        humanize: {
+          type: 'boolean',
+          description: 'Humanized approach path (default true).',
+        },
+        includeScreenshot: {
+          type: 'boolean',
+          description: 'Return a post-hover viewport screenshot plus visualCapture metadata (refsAvailable=false).',
         },
       },
       required: ['tabId'],
@@ -327,6 +487,32 @@ export function buildRequest(name, args, ctx) {
         auth: 'accessKey',
         // includeScreenshot returns {screenshot:{data,mimeType}, visualCapture, ...};
         // the snapshot adapter splits the embedded image into a native image block.
+        responseKind: args.includeScreenshot === true ? 'snapshot' : 'json',
+        body: { ...without(args), userId },
+      };
+    case 'camofox_hold':
+      return {
+        method: 'POST',
+        path: `/tabs/${args.tabId}/hold`,
+        auth: 'accessKey',
+        // includeScreenshot returns {screenshot:{data,mimeType}, visualCapture, ...};
+        // the snapshot adapter splits the embedded image into a native image block.
+        responseKind: args.includeScreenshot === true ? 'snapshot' : 'json',
+        body: { ...without(args), userId },
+      };
+    case 'camofox_drag':
+      return {
+        method: 'POST',
+        path: `/tabs/${args.tabId}/drag`,
+        auth: 'accessKey',
+        responseKind: args.includeScreenshot === true ? 'snapshot' : 'json',
+        body: { ...without(args), userId },
+      };
+    case 'camofox_hover':
+      return {
+        method: 'POST',
+        path: `/tabs/${args.tabId}/hover`,
+        auth: 'accessKey',
         responseKind: args.includeScreenshot === true ? 'snapshot' : 'json',
         body: { ...without(args), userId },
       };

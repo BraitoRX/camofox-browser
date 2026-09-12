@@ -170,7 +170,7 @@ claude mcp add camofox-browser -- node /Users/you/src/camofox-browser/mcp/server
 | Cursor | Settings → MCP — server shows green |
 | opencode | `opencode mcp list` |
 
-You should see 12 tools once the MCP server runs the updated adapter from this checkout: `camofox_create_tab`, `camofox_snapshot`, `camofox_click`, `camofox_type`, `camofox_navigate`, `camofox_scroll`, `camofox_screenshot`, `camofox_evaluate`, `camofox_list_tabs`, `camofox_close_tab`, `camofox_import_cookies`, `camofox_navigation_guard`. The guard is a local addition: older published adapter builds do not advertise it. Editing these files does not update running processes; both the REST server and adapter must load the updated source. Restart/reload only with appropriate authorization.
+You should see 15 tools once the MCP server runs the updated adapter from this checkout: `camofox_create_tab`, `camofox_snapshot`, `camofox_click`, `camofox_hold`, `camofox_drag`, `camofox_hover`, `camofox_type`, `camofox_navigate`, `camofox_scroll`, `camofox_screenshot`, `camofox_evaluate`, `camofox_list_tabs`, `camofox_close_tab`, `camofox_import_cookies`, `camofox_navigation_guard`. The guard is a local addition: older published adapter builds do not advertise it. Editing these files does not update running processes; both the REST server and adapter must load the updated source. Restart/reload only with appropriate authorization.
 
 ## Tools
 
@@ -180,6 +180,9 @@ You should see 12 tools once the MCP server runs the updated adapter from this c
 | `camofox_snapshot` | Accessibility snapshot + element refs (`e1`, `e2`, ...) + screenshot |
 | `camofox_navigate` | Go to a URL **or** use a search macro (`@google_search`, `@reddit_search`, ...) |
 | `camofox_click` | Click by element ref (`e1`), CSS selector, or screenshot coordinates `{x, y, captureId}` |
+| `camofox_hold` | Press and hold (long-press) by ref/selector/coordinates — trusted native mouse-down held for `durationMs` with humanized motion, then released |
+| `camofox_drag` | Drag from a source to a target (ref/selector/coordinates each) with a humanized native drag |
+| `camofox_hover` | Move the mouse over a target with a humanized approach and `settleMs` dwell |
 | `camofox_type` | Type text into a ref/selector, optional `pressEnter` |
 | `camofox_scroll` | Scroll by pixels (unreliable on lazy-load pages — prefer `camofox_evaluate` on unguarded tabs; an active navigation guard requires this native scroll) |
 | `camofox_screenshot` | Viewport screenshot + `visualCapture` metadata (`captureId`) for coordinate clicks |
@@ -188,6 +191,30 @@ You should see 12 tools once the MCP server runs the updated adapter from this c
 | `camofox_close_tab` | Close a tab |
 | `camofox_import_cookies` | Import a Netscape cookie file (needs `CAMOFOX_API_KEY`) |
 | `camofox_navigation_guard` | Start/inspect an opt-in links-only guard: blocks caller JS and direct navigation, allows native hyperlink clicks, bounded ledger |
+
+### Press and hold (captchas)
+
+```js
+camofox_hold({ tabId, coordinates: { x, y, captureId }, durationMs: 12000 })
+```
+
+Holds one trusted native mouse press for `durationMs` (default 3000, max 20000) with a humanized approach and micro-movements, then releases; screenshot again afterwards to see whether the challenge cleared; blocked while the links-only navigation guard is active. PerimeterX-style challenges can clear asynchronously ~10-15s after the release, so wait before judging the result.
+
+### Drag and drop
+
+```js
+camofox_drag({ tabId, source: { ref: 'e1' }, target: { selector: '#dropzone' }, holdBeforeDropMs: 200 })
+```
+
+Ref/selector endpoints are scrolled into view first, and both endpoints must be inside the viewport when the drag starts; coordinate endpoints are viewport-relative and never scrolled.
+
+### Hover
+
+```js
+camofox_hover({ tabId, selector: '#menu', settleMs: 500 })
+```
+
+Ref/selector targets are scrolled into view first.
 
 ### Navigation guard (opt-in)
 

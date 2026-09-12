@@ -79,11 +79,13 @@ import {
   transferNavigationGuard,
 } from './lib/navigation-guard.js';
 import { withNativeInput, createStallRecovery } from './lib/native-input.js';
+import { humanizedHold, humanizedDrag, humanizedHover, HOLD_DEFAULT_MS, HOLD_MIN_MS, HOLD_MAX_MS } from './lib/gestures.js';
 
 const CONFIG = loadConfig();
 
 // --- Crash reporter (opt-in, anonymized GitHub issues) ---
 import { readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
 const _pkgVersion = (() => { try { return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version; } catch { return 'unknown'; } })();
 
 // --- Sentry error tracking ---
@@ -275,6 +277,14 @@ function invalidSelectorError(message) {
 const NON_FILLABLE_INPUT_TYPES = new Set(['button', 'checkbox', 'color', 'file', 'hidden', 'image', 'radio', 'range', 'reset', 'submit']);
 
 async function assertLocatorFillable(locator) {
+  // count() resolves immediately (no auto-wait): fail fast with a retryable 422
+  // instead of letting a non-matching selector consume the handler budget inside
+  // evaluate()'s default wait.
+  if (await locator.count() === 0) {
+    const error = new Error('Selector did not match any element. Call snapshot and use a current element ref or a matching selector.');
+    error.statusCode = 422;
+    throw error;
+  }
   const info = await locator.evaluate((el) => {
     const tagName = el.tagName?.toLowerCase?.() || '';
     const type = tagName === 'input' ? (el.getAttribute('type') || 'text').toLowerCase() : '';
@@ -616,12 +626,35 @@ function withTimeout(promise, ms, label) {
   ]);
 }
 
+// A click that times out while the page is navigating is normally a success:
+// Playwright's click waits for the navigation it initiates, and a real page load
+// easily exceeds the 3s actionability budget. Treat a URL change as success so a
+// slow navigation never falls into the destructive native-mouse fallback.
+async function urlChangedSince(page, previousUrl, timeoutMs) {
+  if (!page || page.isClosed()) return false;
+  if (page.url() !== previousUrl) return true;
+  try {
+    await page.waitForURL((u) => String(u) !== previousUrl, { timeout: timeoutMs, waitUntil: 'commit' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Browser-wide native input serialization + stall recovery. `restartBrowser`
 // and `log` are function declarations defined later; hoisting makes these
 // early references valid.
 const nativeInputRecovery = createStallRecovery({ restartBrowser, log });
-const NATIVE_INPUT_TIMEOUT_RE = /native (?:coordinate click|mouse move|mouse down|mouse up|mouse sequence|scroll wheel) timed out after/;
+const NATIVE_INPUT_TIMEOUT_RE = /native (?:coordinate click|mouse move|mouse down|mouse up|mouse sequence|hold gesture|drag gesture|mouse hover|scroll wheel) timed out after/;
 const NATIVE_WHEEL_TIMEOUT_MS = 10000;
+// Cap the native-mouse fallback so a wedged shared input pipeline surfaces as a
+// bounded failure (triggering the input-stall probe/restart) instead of eating
+// the whole 30s handler budget and destroying the tab.
+const NATIVE_FALLBACK_TIMEOUT_MS = 6000;
+// Bound the unbounded keyboard steps of /type so a wedged input pipeline returns
+// the existing retryable 409 instead of a 30s action timeout.
+const TYPE_KEYBOARD_TIMEOUT_MS = 10000;
+const TYPE_ENTER_TIMEOUT_MS = 5000;
 async function dispatchNativeInput({ label, budget, run, probe, meta = {} }) {
   try {
     return await withNativeInput(() => withTimeout(run(), Math.max(1, typeof budget === 'function' ? budget() : budget), label));
@@ -801,6 +834,7 @@ const healthState = {
   isRecovering: false,
   activeOps: 0,
   lastSuccessfulNav: Date.now(),
+  consecutiveProbeFailures: 0,
 };
 
 function getUserNavHealth(userId) {
@@ -2718,6 +2752,81 @@ async function refreshTabRefs(tabState, options = {}) {
   return refreshedRefs;
 }
 
+// Resolve one gesture target (ref/selector/coordinates) to a CSS point.
+// Shared by /hover and /drag; mirrors the click route's resolution rules.
+async function resolveGestureTarget(tabState, spec, { label, budget, reqId, tabId, scrollIntoView = false }) {
+  if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
+    const err = new Error(`${label} must be an object with exactly one of ref, selector, or coordinates`);
+    err.statusCode = 400;
+    throw err;
+  }
+  const hasCoordinates = spec.coordinates !== undefined && spec.coordinates !== null;
+  const targetCount = (spec.ref ? 1 : 0) + (spec.selector ? 1 : 0) + (hasCoordinates ? 1 : 0);
+  if (targetCount !== 1) {
+    const err = new Error(`${label} must specify exactly one of ref, selector, or coordinates`);
+    err.statusCode = 400;
+    throw err;
+  }
+  if (hasCoordinates) {
+    const resolved = await resolveCoordinatesToCss(tabState, spec.coordinates);
+    return { x: resolved.cssX, y: resolved.cssY };
+  }
+  const selectorErr = selectorValidationError(spec.selector);
+  if (selectorErr) throw invalidSelectorError(selectorErr);
+  let locator;
+  if (spec.ref) {
+    locator = refToLocator(tabState.page, spec.ref, tabState.refs);
+    if (!locator) {
+      log('info', `auto-refreshing refs before ${label}`, { ref: spec.ref, hadRefs: tabState.refs.size });
+      try {
+        const preBudget = Math.min(4000, budget());
+        tabState.refs = await refreshTabRefs(tabState, { reason: `pre_${label}`, timeoutMs: preBudget });
+      } catch (e) {
+        if (e.message === `pre_${label}_refs_timeout` || e.message === 'buildRefs_timeout') {
+          log('warn', `pre-${label} buildRefs timed out, proceeding without refresh`);
+        } else {
+          throw e;
+        }
+      }
+      locator = refToLocator(tabState.page, spec.ref, tabState.refs);
+    }
+    if (!locator) {
+      const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none';
+      throw new StaleRefsError(spec.ref, maxRef, tabState.refs.size);
+    }
+  } else {
+    locator = tabState.page.locator(spec.selector);
+    const visibleSelector = visibleSelectorCandidate(spec.selector);
+    if (visibleSelector) {
+      const visibleLocator = tabState.page.locator(visibleSelector);
+      if (await visibleLocator.count() === 1) {
+        locator = visibleLocator;
+      }
+    }
+  }
+  if (scrollIntoView) {
+    try {
+      await locator.scrollIntoViewIfNeeded({ timeout: Math.max(500, Math.min(3000, budget())) });
+    } catch (e) {
+      // Best effort: boundingBox() below reports actionability failures.
+    }
+  }
+  const bboxTimeout = Math.max(500, Math.min(3000, budget()));
+  let box;
+  try {
+    box = await locator.boundingBox({ timeout: bboxTimeout });
+  } catch (e) {
+    const detachedErr = new Error(`Element not actionable: no bounding box within ${bboxTimeout}ms (element likely detached after page change). Call snapshot to refresh refs and retry.`);
+    detachedErr.statusCode = 422;
+    throw detachedErr;
+  }
+  if (!box) {
+    const notVisibleErr = new Error('Element not visible (no bounding box)');
+    notVisibleErr.statusCode = 422;
+    throw notVisibleErr;
+  }
+  return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+}
 
 /**
  * @openapi
@@ -3933,7 +4042,11 @@ app.post('/tabs/:tabId/wait', async (req, res) => {
  *                 description: CSS selector fallback.
  *               doubleClick:
  *                 type: boolean
- *                 description: Double-click (only used with coordinates).
+ *                 description: Double-click (coordinates, ref, or selector). Refused while the links-only navigation guard is active.
+ *               button:
+ *                 type: string
+ *                 enum: [left, right, middle]
+ *                 description: Mouse button (default left). Non-left buttons are refused while the links-only navigation guard is active.
  *               includeScreenshot:
  *                 type: boolean
  *                 description: >
@@ -4004,6 +4117,10 @@ app.post('/tabs/:tabId/click', async (req, res) => {
     const { userId, ref, selector, coordinates } = req.body;
     const doubleClick = req.body.doubleClick === true;
     const includeScreenshot = req.body.includeScreenshot === true;
+    const button = req.body.button === undefined ? 'left' : req.body.button;
+    if (button !== 'left' && button !== 'right' && button !== 'middle') {
+      return res.status(400).json({ error: "button must be 'left', 'right', or 'middle'" });
+    }
     if (!userId) return res.status(400).json({ error: 'userId required' });
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, tabId);
@@ -4036,8 +4153,8 @@ app.post('/tabs/:tabId/click', async (req, res) => {
       tabState = liveState;
       // Early policy shape validation, outside the ledger: a double activation
       // is refused before any action record exists.
-      if (isNavigationGuardActive(tabState) && doubleClick) {
-        throw guardError('navigation_guard_violation', 'doubleClick is not allowed while the links-only navigation guard is active; the guard permits single native hyperlink clicks only.', 403);
+      if (isNavigationGuardActive(tabState) && (doubleClick || button !== 'left')) {
+        throw guardError('navigation_guard_violation', 'doubleClick and non-left mouse buttons are not allowed while the links-only navigation guard is active; the guard permits single native left hyperlink clicks only.', 403);
       }
       const guardEntry = beginGuardedClick(tabState, { kind: hasCoordinates ? 'coordinates' : (ref ? 'ref' : 'selector') });
       if (guardEntry) {
@@ -4075,7 +4192,8 @@ app.post('/tabs/:tabId/click', async (req, res) => {
         // NOTE: the message deliberately avoids the 'timed out after' phrase so
         // isTimeoutError() doesn't classify a detached element as a navigation
         // timeout and destroy the whole session in handleRouteError().
-        const bboxTimeout = Math.max(500, Math.min(3000, remainingBudget()));
+        const mouseBudget = () => Math.max(500, Math.min(remainingBudget(), NATIVE_FALLBACK_TIMEOUT_MS));
+        const bboxTimeout = Math.max(500, Math.min(3000, mouseBudget()));
         let box;
         try {
           box = await locator.boundingBox({ timeout: bboxTimeout });
@@ -4092,15 +4210,15 @@ app.post('/tabs/:tabId/click', async (req, res) => {
         // Move mouse to element (triggers mouseover/mouseenter)
         await dispatchNativeInput({
           label: 'native mouse sequence',
-          budget: remainingBudget,
+          budget: mouseBudget,
           run: async () => {
-            await withTimeout(tabState.page.mouse.move(x, y), Math.max(1, remainingBudget()), 'native mouse move');
+            await withTimeout(tabState.page.mouse.move(x, y), Math.max(1, mouseBudget()), 'native mouse move');
             await tabState.page.waitForTimeout(50);
             
             // Full click sequence
-            await withTimeout(tabState.page.mouse.down(), Math.max(1, remainingBudget()), 'native mouse down');
+            await withTimeout(tabState.page.mouse.down({ button }), Math.max(1, mouseBudget()), 'native mouse down');
             await tabState.page.waitForTimeout(50);
-            await withTimeout(tabState.page.mouse.up(), Math.max(1, remainingBudget()), 'native mouse up');
+            await withTimeout(tabState.page.mouse.up({ button }), Math.max(1, mouseBudget()), 'native mouse up');
           },
           probe: () => tabState.page.mouse.move(x, y),
           meta: { reqId: req.reqId, tabId },
@@ -4138,7 +4256,9 @@ app.post('/tabs/:tabId/click', async (req, res) => {
             log('info', 'click constrained selector to visible match', { selector: locatorOrSelector });
           }
         }
-        const click = async (options) => clickWithDownloadGuard(tabState, () => locator.click(options));
+        // button/doubleClick now apply to ref/selector clicks too; guarded mode
+        // refuses both before this point.
+        const click = async (options) => clickWithDownloadGuard(tabState, () => locator.click({ button, clickCount: doubleClick ? 2 : 1, ...options }));
         
         if (onGoogleSerp) {
           try {
@@ -4150,6 +4270,7 @@ app.post('/tabs/:tabId/click', async (req, res) => {
           return;
         }
         
+        const urlBefore = tabState.page.url();
         try {
           // First try normal click (respects visibility, enabled, not-obscured)
           await click({ timeout: 3000 });
@@ -4165,6 +4286,14 @@ app.post('/tabs/:tabId/click', async (req, res) => {
               await dispatchMouseSequence(locator);
             }
           } else if (err.message.includes('not visible') || err.message.toLowerCase().includes('timeout')) {
+            // Playwright waits for the navigation a click initiates; a normal link
+            // click on a slow page blows the 3s budget. If the URL changed, the
+            // click worked -- do not dispatch the native-mouse fallback, which can
+            // wedge the shared input pipeline and destroy the tab.
+            if (await urlChangedSince(tabState.page, urlBefore, 2500)) {
+              log('info', 'click timeout resolved by navigation; skipping mouse fallback', { from: urlBefore, to: tabState.page.url() });
+              return;
+            }
             // Fallback 2: Element not responding to click, try mouse sequence
             log('warn', 'click timeout, trying mouse sequence');
             await dispatchMouseSequence(locator);
@@ -4204,7 +4333,7 @@ app.post('/tabs/:tabId/click', async (req, res) => {
             await clickWithDownloadGuard(tabState, () => dispatchNativeInput({
               label: 'native coordinate click',
               budget: remainingBudget,
-              run: () => tabState.page.mouse.click(cssX, cssY, { clickCount: doubleClick ? 2 : 1 }),
+              run: () => tabState.page.mouse.click(cssX, cssY, { clickCount: doubleClick ? 2 : 1, button }),
               probe: () => tabState.page.mouse.move(cssX, cssY),
               meta: { reqId: req.reqId, tabId },
             }));
@@ -4370,6 +4499,635 @@ app.post('/tabs/:tabId/click', async (req, res) => {
       }
     }
     handleRouteError(err, req, res, guardReceipt ? { action: guardReceipt } : {});
+  }
+});
+
+// Press-and-hold (humanized long press). Dispatches one trusted native
+// mouse-down, holds for durationMs (optionally with micro-movements), then
+// releases. Built for "press and hold" human-verification widgets.
+/**
+ * @openapi
+ * /tabs/{tabId}/hold:
+ *   post:
+ *     tags: [Interaction]
+ *     summary: Press and hold a target (humanized long press)
+ *     description: >
+ *       Dispatches one trusted native mouse press at a target (element ref,
+ *       CSS selector, or image-pixel coordinates from the latest viewport
+ *       screenshot), keeps it pressed for durationMs while optionally emitting
+ *       small humanized micro-movements, then releases. Intended for
+ *       "press and hold" human-verification widgets (e.g. PerimeterX
+ *       captchas). Coordinates must carry the captureId from that screenshot's
+ *       visualCapture metadata and cannot be combined with ref/selector.
+ *       Blocked while the opt-in links-only navigation guard is active.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               ref:
+ *                 type: string
+ *                 description: Element ref ID (e.g. "e3").
+ *               selector:
+ *                 type: string
+ *                 description: CSS selector fallback.
+ *               coordinates:
+ *                 type: object
+ *                 description: Image-pixel coordinates in the latest standalone screenshot (its visualCapture.captureId). Mutually exclusive with ref/selector.
+ *                 required: [x, y, captureId]
+ *                 properties:
+ *                   x:
+ *                     type: number
+ *                   y:
+ *                     type: number
+ *                   captureId:
+ *                     type: string
+ *                 additionalProperties: false
+ *               durationMs:
+ *                 type: integer
+ *                 description: Hold duration in milliseconds (100..20000; default 3000).
+ *               humanize:
+ *                 type: boolean
+ *                 description: Humanized approach path plus micro-movements during the hold (default true).
+ *               includeScreenshot:
+ *                 type: boolean
+ *                 description: Return a post-hold viewport screenshot plus visualCapture metadata instead of rebuilding element refs (refsAvailable=false).
+ *     responses:
+ *       200:
+ *         description: Hold completed with optional post-hold screenshot and visualCapture metadata.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *       400:
+ *         description: Bad request (invalid_coordinates for malformed/out-of-range coordinates, or durationMs out of range).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Blocked by the active links-only navigation guard (code navigation_guard_violation).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       409:
+ *         description: Visual capture is stale or the page changed; retry with a fresh screenshot/snapshot.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       422:
+ *         description: Target element is not actionable (no bounding box / detached).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.post('/tabs/:tabId/hold', async (req, res) => {
+  const tabId = req.params.tabId;
+
+  try {
+    const { userId, ref, selector, coordinates } = req.body;
+    const humanize = req.body.humanize !== false;
+    const includeScreenshot = req.body.includeScreenshot === true;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, tabId);
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    // Opt-in guard: a long press is native pointer input, not a hyperlink click.
+    assertNavigationActionAllowed(found.tabState, 'hold');
+    session.lastAccess = Date.now();
+
+    let { tabState } = found;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+
+    const hasCoordinates = coordinates !== undefined && coordinates !== null;
+    if (hasCoordinates && (ref || selector)) {
+      throw invalidCoordinatesError('coordinates cannot be combined with ref or selector');
+    }
+    if (!ref && !selector && !hasCoordinates) {
+      return res.status(400).json({ error: 'ref, selector, or coordinates required' });
+    }
+    const selectorErr = selectorValidationError(selector);
+    if (selectorErr) throw invalidSelectorError(selectorErr);
+
+    const maxHoldMs = Math.max(HOLD_MIN_MS, Math.min(HOLD_MAX_MS, HANDLER_TIMEOUT_MS - 5000));
+    const durationMs = req.body.durationMs === undefined ? HOLD_DEFAULT_MS : Number(req.body.durationMs);
+    if (!Number.isFinite(durationMs) || durationMs < HOLD_MIN_MS || durationMs > maxHoldMs) {
+      return res.status(400).json({ error: `durationMs must be a finite number between ${HOLD_MIN_MS} and ${maxHoldMs}` });
+    }
+
+    let holdTarget = null;
+    const result = await withUserLimit(userId, () => withTabLock(tabId, async () => {
+      const holdStart = Date.now();
+      const remainingBudget = () => Math.max(0, HANDLER_TIMEOUT_MS - 2000 - (Date.now() - holdStart));
+      // Same live-state discipline as click: a queued replacement must never be
+      // acted on via a stale pre-lock capture.
+      tabState = assertCurrentTabActionAllowed(userId, tabId, 'hold');
+
+      const spec = hasCoordinates ? { coordinates } : (ref ? { ref } : { selector });
+      const point = await resolveGestureTarget(tabState, spec, { label: 'target', budget: remainingBudget, reqId: req.reqId, tabId, scrollIntoView: true });
+      const x = point.x;
+      const y = point.y;
+
+      // Invalidate the capture immediately before dispatch (same as click): a
+      // partial or timed-out hold must not leave it reusable.
+      tabState.visualCapture = null;
+      holdTarget = { x: Number(x.toFixed(1)), y: Number(y.toFixed(1)) };
+      log('info', 'hold gesture', { reqId: req.reqId, tabId, x: holdTarget.x, y: holdTarget.y, durationMs, humanize });
+
+      const holdResult = await dispatchNativeInput({
+        label: 'native hold gesture',
+        budget: () => Math.max(1000, remainingBudget()),
+        run: () => humanizedHold(tabState.page, { x, y, durationMs, humanize }),
+        probe: () => tabState.page.mouse.move(x, y),
+        meta: { reqId: req.reqId, tabId },
+      });
+
+      await tabState.page.waitForTimeout(500).catch(() => {});
+      tabState.lastSnapshot = null;
+      tabState.refs = new Map();
+      const newUrl = tabState.page.url();
+      tabState.visitedUrls.add(newUrl);
+
+      const out = {
+        ok: true,
+        url: newUrl,
+        heldMs: holdResult.heldMs,
+        target: holdTarget,
+        refsAvailable: false,
+      };
+      if (includeScreenshot) {
+        try {
+          const { buffer, visualCapture } = await captureVisualState(tabState);
+          out.screenshot = { data: buffer.toString('base64'), mimeType: 'image/png' };
+          out.visualCapture = visualCapture;
+        } catch (screenshotErr) {
+          log('warn', 'post-hold screenshot failed', { reqId: req.reqId, tabId, error: screenshotErr.message });
+          out.screenshotError = `Post-hold screenshot failed: ${safeError(screenshotErr)}`;
+        }
+      }
+      return out;
+    }, HANDLER_TIMEOUT_MS, () => destroyTimedOutTab(session, tabId, 'operation_timeout', userId)));
+
+    log('info', 'held', { reqId: req.reqId, tabId, durationMs, humanize, target: holdTarget });
+    pluginEvents.emit('tab:hold', {
+      userId: req.body.userId,
+      tabId,
+      durationMs,
+      humanize,
+      ...(holdTarget ? { coordinates: holdTarget } : {}),
+    });
+    res.json(result);
+  } catch (err) {
+    if (isGuardError(err)) return handleRouteError(err, req, res);
+    log('error', 'hold failed', { reqId: req.reqId, tabId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
+// Hover (humanized native pointer move)
+/**
+ * @openapi
+ * /tabs/{tabId}/hover:
+ *   post:
+ *     tags: [Interaction]
+ *     summary: Move the mouse over a target (humanized hover)
+ *     description: >
+ *       Resolves a target (element ref, CSS selector, or image-pixel
+ *       coordinates from the latest viewport screenshot) and moves the native
+ *       pointer over its center with a humanized approach, then dwells for
+ *       settleMs so hover menus/tooltips can open. Blocked while the opt-in
+ *       links-only navigation guard is active.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               ref:
+ *                 type: string
+ *               selector:
+ *                 type: string
+ *               coordinates:
+ *                 type: object
+ *                 description: Image-pixel coordinates in the latest standalone screenshot (its visualCapture.captureId). Mutually exclusive with ref/selector.
+ *                 required: [x, y, captureId]
+ *                 properties:
+ *                   x:
+ *                     type: number
+ *                   y:
+ *                     type: number
+ *                   captureId:
+ *                     type: string
+ *                 additionalProperties: false
+ *               settleMs:
+ *                 type: integer
+ *                 description: Dwell time after the move (0..5000; default 300).
+ *               humanize:
+ *                 type: boolean
+ *                 description: Humanized approach path (default true).
+ *               includeScreenshot:
+ *                 type: boolean
+ *                 description: Return a post-hover viewport screenshot plus visualCapture metadata.
+ *     responses:
+ *       200:
+ *         description: Hover completed with optional post-hover screenshot.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *       400:
+ *         description: Bad request (invalid target, settleMs out of range, invalid_coordinates).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Blocked by the active links-only navigation guard (code navigation_guard_violation).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       409:
+ *         description: Visual capture is stale or the page changed.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       422:
+ *         description: Target element is not actionable (no bounding box / detached).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.post('/tabs/:tabId/hover', async (req, res) => {
+  const tabId = req.params.tabId;
+
+  try {
+    const { userId, ref, selector, coordinates } = req.body;
+    const humanize = req.body.humanize !== false;
+    const includeScreenshot = req.body.includeScreenshot === true;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, tabId);
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    // Opt-in guard: a native pointer move is not a hyperlink click.
+    assertNavigationActionAllowed(found.tabState, 'hover');
+    session.lastAccess = Date.now();
+
+    let { tabState } = found;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+
+    const hasCoordinates = coordinates !== undefined && coordinates !== null;
+    if (hasCoordinates && (ref || selector)) {
+      throw invalidCoordinatesError('coordinates cannot be combined with ref or selector');
+    }
+    if (!ref && !selector && !hasCoordinates) {
+      return res.status(400).json({ error: 'ref, selector, or coordinates required' });
+    }
+    const settleMs = req.body.settleMs === undefined ? 300 : Number(req.body.settleMs);
+    if (!Number.isFinite(settleMs) || settleMs < 0 || settleMs > 5000) {
+      return res.status(400).json({ error: 'settleMs must be a finite number between 0 and 5000' });
+    }
+
+    let hoverTarget = null;
+    const result = await withUserLimit(userId, () => withTabLock(tabId, async () => {
+      const start = Date.now();
+      const remainingBudget = () => Math.max(0, HANDLER_TIMEOUT_MS - 2000 - (Date.now() - start));
+      tabState = assertCurrentTabActionAllowed(userId, tabId, 'hover');
+
+      const spec = hasCoordinates ? { coordinates } : (ref ? { ref } : { selector });
+      const point = await resolveGestureTarget(tabState, spec, { label: 'target', budget: remainingBudget, reqId: req.reqId, tabId, scrollIntoView: true });
+
+      tabState.visualCapture = null;
+      hoverTarget = { x: Number(point.x.toFixed(1)), y: Number(point.y.toFixed(1)) };
+      log('info', 'hover gesture', { reqId: req.reqId, tabId, x: hoverTarget.x, y: hoverTarget.y, settleMs, humanize });
+
+      await dispatchNativeInput({
+        label: 'native mouse hover',
+        budget: () => Math.max(1000, remainingBudget()),
+        run: () => humanizedHover(tabState.page, { x: point.x, y: point.y, humanize, settleMs }),
+        probe: () => tabState.page.mouse.move(point.x, point.y),
+        meta: { reqId: req.reqId, tabId },
+      });
+
+      await tabState.page.waitForTimeout(200).catch(() => {});
+      tabState.lastSnapshot = null;
+      tabState.refs = new Map();
+      const newUrl = tabState.page.url();
+      tabState.visitedUrls.add(newUrl);
+
+      const out = { ok: true, url: newUrl, target: hoverTarget, refsAvailable: false };
+      if (includeScreenshot) {
+        try {
+          const { buffer, visualCapture } = await captureVisualState(tabState);
+          out.screenshot = { data: buffer.toString('base64'), mimeType: 'image/png' };
+          out.visualCapture = visualCapture;
+        } catch (screenshotErr) {
+          log('warn', 'post-hover screenshot failed', { reqId: req.reqId, tabId, error: screenshotErr.message });
+          out.screenshotError = `Post-hover screenshot failed: ${safeError(screenshotErr)}`;
+        }
+      }
+      return out;
+    }, HANDLER_TIMEOUT_MS, () => destroyTimedOutTab(session, tabId, 'operation_timeout', userId)));
+
+    log('info', 'hovered', { reqId: req.reqId, tabId, target: hoverTarget });
+    pluginEvents.emit('tab:hover', {
+      userId: req.body.userId,
+      tabId,
+      settleMs,
+      humanize,
+      ...(hoverTarget ? { coordinates: hoverTarget } : {}),
+    });
+    res.json(result);
+  } catch (err) {
+    if (isGuardError(err)) return handleRouteError(err, req, res);
+    log('error', 'hover failed', { reqId: req.reqId, tabId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
+// Drag and drop (humanized native mouse drag)
+/**
+ * @openapi
+ * /tabs/{tabId}/drag:
+ *   post:
+ *     tags: [Interaction]
+ *     summary: Drag and drop from a source to a target (humanized native drag)
+ *     description: >
+ *       Resolves a source and a target (each an element ref, CSS selector, or
+ *       image-pixel coordinates from the latest viewport screenshot), presses
+ *       the primary button at the source center, moves along a humanized
+ *       multi-segment path to the target center, optionally dwells there, then
+ *       releases. Works for mouse-event drag implementations and HTML5
+ *       draggable elements (Firefox derives native drag from trusted mouse
+ *       input). Ref/selector endpoints are scrolled into view first, and both
+ *       endpoints must be inside the viewport when the drag starts (scroll so
+ *       both are visible, or pass coordinates). Blocked while the opt-in
+ *       links-only navigation guard is active.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId, source, target]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               source:
+ *                 type: object
+ *                 description: Drag source; exactly one of ref, selector, or coordinates.
+ *                 properties:
+ *                   ref:
+ *                     type: string
+ *                   selector:
+ *                     type: string
+ *                   coordinates:
+ *                     type: object
+ *                     required: [x, y, captureId]
+ *                     properties:
+ *                       x:
+ *                         type: number
+ *                       y:
+ *                         type: number
+ *                       captureId:
+ *                         type: string
+ *                     additionalProperties: false
+ *                 additionalProperties: false
+ *               target:
+ *                 type: object
+ *                 description: Drop target; exactly one of ref, selector, or coordinates.
+ *                 properties:
+ *                   ref:
+ *                     type: string
+ *                   selector:
+ *                     type: string
+ *                   coordinates:
+ *                     type: object
+ *                     required: [x, y, captureId]
+ *                     properties:
+ *                       x:
+ *                         type: number
+ *                       y:
+ *                         type: number
+ *                       captureId:
+ *                         type: string
+ *                     additionalProperties: false
+ *                 additionalProperties: false
+ *               steps:
+ *                 type: integer
+ *                 description: Intermediate mousemove dispatches along the path (1..60; default humanized 10..20).
+ *               holdBeforeDropMs:
+ *                 type: integer
+ *                 description: Dwell over the target before releasing (0..5000; default humanized 80..250, 0 when humanize=false).
+ *               humanize:
+ *                 type: boolean
+ *                 description: Humanized approach and jittered path (default true).
+ *               includeScreenshot:
+ *                 type: boolean
+ *                 description: Return a post-drag viewport screenshot plus visualCapture metadata.
+ *     responses:
+ *       200:
+ *         description: Drag completed with optional post-drag screenshot.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *       400:
+ *         description: Bad request (malformed source/target, out-of-range steps/holdBeforeDropMs, invalid_coordinates).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Blocked by the active links-only navigation guard (code navigation_guard_violation).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       409:
+ *         description: Visual capture is stale or the page changed.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       422:
+ *         description: Source or target element is not actionable (no bounding box / detached).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.post('/tabs/:tabId/drag', async (req, res) => {
+  const tabId = req.params.tabId;
+
+  try {
+    const { userId, source, target } = req.body;
+    const humanize = req.body.humanize !== false;
+    const includeScreenshot = req.body.includeScreenshot === true;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, tabId);
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    // Opt-in guard: a native drag is not a hyperlink click.
+    assertNavigationActionAllowed(found.tabState, 'drag');
+    session.lastAccess = Date.now();
+
+    let { tabState } = found;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+
+    if (!source || !target) {
+      return res.status(400).json({ error: 'source and target are required' });
+    }
+    const steps = req.body.steps === undefined ? null : Number(req.body.steps);
+    if (steps !== null && (!Number.isFinite(steps) || steps < 1 || steps > 60)) {
+      return res.status(400).json({ error: 'steps must be a finite number between 1 and 60' });
+    }
+    const holdBeforeDropMs = req.body.holdBeforeDropMs === undefined ? null : Number(req.body.holdBeforeDropMs);
+    if (holdBeforeDropMs !== null && (!Number.isFinite(holdBeforeDropMs) || holdBeforeDropMs < 0 || holdBeforeDropMs > 5000)) {
+      return res.status(400).json({ error: 'holdBeforeDropMs must be a finite number between 0 and 5000' });
+    }
+
+    let dragFrom = null;
+    let dragTo = null;
+    const result = await withUserLimit(userId, () => withTabLock(tabId, async () => {
+      const start = Date.now();
+      const remainingBudget = () => Math.max(0, HANDLER_TIMEOUT_MS - 2000 - (Date.now() - start));
+      tabState = assertCurrentTabActionAllowed(userId, tabId, 'drag');
+
+      // Coordinate endpoints are viewport-relative: never scroll when either
+      // endpoint is a coordinate (a scroll would invalidate the capture's
+      // mapping). Ref/selector endpoints are scrolled into view first, then
+      // both are re-measured so a scroll caused by one endpoint cannot leave
+      // the other's press point stale.
+      const sourceIsCoordinates = Boolean(source && source.coordinates);
+      const targetIsCoordinates = Boolean(target && target.coordinates);
+      const canScroll = !sourceIsCoordinates && !targetIsCoordinates;
+      const firstSource = await resolveGestureTarget(tabState, source, { label: 'source', budget: remainingBudget, reqId: req.reqId, tabId, scrollIntoView: canScroll });
+      const firstTarget = await resolveGestureTarget(tabState, target, { label: 'target', budget: remainingBudget, reqId: req.reqId, tabId, scrollIntoView: canScroll });
+      const from = canScroll
+        ? await resolveGestureTarget(tabState, source, { label: 'source', budget: remainingBudget, reqId: req.reqId, tabId })
+        : firstSource;
+      const to = canScroll
+        ? await resolveGestureTarget(tabState, target, { label: 'target', budget: remainingBudget, reqId: req.reqId, tabId })
+        : firstTarget;
+      const viewport = await tabState.page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }));
+      const insideViewport = (p) => p.x >= 0 && p.y >= 0 && p.x < viewport.width && p.y < viewport.height;
+      if (!insideViewport(from) || !insideViewport(to)) {
+        const offErr = new Error('Drag source and target must both be inside the viewport; scroll so both are visible, or pass coordinates.');
+        offErr.statusCode = 422;
+        throw offErr;
+      }
+
+      tabState.visualCapture = null;
+      dragFrom = { x: Number(from.x.toFixed(1)), y: Number(from.y.toFixed(1)) };
+      dragTo = { x: Number(to.x.toFixed(1)), y: Number(to.y.toFixed(1)) };
+      log('info', 'drag gesture', { reqId: req.reqId, tabId, from: dragFrom, to: dragTo, steps, holdBeforeDropMs, humanize });
+
+      const dragResult = await dispatchNativeInput({
+        label: 'native drag gesture',
+        budget: () => Math.max(1000, remainingBudget()),
+        run: () => humanizedDrag(tabState.page, {
+          fromX: from.x,
+          fromY: from.y,
+          toX: to.x,
+          toY: to.y,
+          steps: steps === null ? undefined : steps,
+          holdBeforeDropMs: holdBeforeDropMs === null ? undefined : holdBeforeDropMs,
+          humanize,
+        }),
+        probe: () => tabState.page.mouse.move(from.x, from.y),
+        meta: { reqId: req.reqId, tabId },
+      });
+
+      await tabState.page.waitForTimeout(500).catch(() => {});
+      tabState.lastSnapshot = null;
+      tabState.refs = new Map();
+      const newUrl = tabState.page.url();
+      tabState.visitedUrls.add(newUrl);
+
+      const out = {
+        ok: true,
+        url: newUrl,
+        from: dragFrom,
+        to: dragTo,
+        dragMs: dragResult.dragMs,
+        refsAvailable: false,
+      };
+      if (includeScreenshot) {
+        try {
+          const { buffer, visualCapture } = await captureVisualState(tabState);
+          out.screenshot = { data: buffer.toString('base64'), mimeType: 'image/png' };
+          out.visualCapture = visualCapture;
+        } catch (screenshotErr) {
+          log('warn', 'post-drag screenshot failed', { reqId: req.reqId, tabId, error: screenshotErr.message });
+          out.screenshotError = `Post-drag screenshot failed: ${safeError(screenshotErr)}`;
+        }
+      }
+      return out;
+    }, HANDLER_TIMEOUT_MS, () => destroyTimedOutTab(session, tabId, 'operation_timeout', userId)));
+
+    log('info', 'dragged', { reqId: req.reqId, tabId, from: dragFrom, to: dragTo });
+    pluginEvents.emit('tab:drag', {
+      userId: req.body.userId,
+      tabId,
+      ...(dragFrom ? { from: dragFrom } : {}),
+      ...(dragTo ? { to: dragTo } : {}),
+    });
+    res.json(result);
+  } catch (err) {
+    if (isGuardError(err)) return handleRouteError(err, req, res);
+    log('error', 'drag failed', { reqId: req.reqId, tabId, error: err.message });
+    handleRouteError(err, req, res);
   }
 });
 
@@ -4965,9 +5723,9 @@ app.post('/tabs/:tabId/type', async (req, res) => {
         } else if (selector) {
           await tabState.page.focus(selector, { timeout: 10000 });
         }
-        await tabState.page.keyboard.type(text, { delay });
+        await withTimeout(tabState.page.keyboard.type(text, { delay }), TYPE_KEYBOARD_TIMEOUT_MS, 'keyboard type');
       }
-      if (shouldSubmit) await tabState.page.keyboard.press('Enter');
+      if (shouldSubmit) await withTimeout(tabState.page.keyboard.press('Enter'), TYPE_ENTER_TIMEOUT_MS, 'keyboard enter');
     });
     
     pluginEvents.emit('tab:type', typeEventPayload({ userId: req.body.userId, tabId, text: req.body.text, ref: req.body.ref, mode: req.body.mode }));
@@ -7669,36 +8427,63 @@ setInterval(() => {
   });
 }, 5 * 60_000);
 
-// Active health probe -- detect hung browser even when isConnected() lies
+// Active health probe -- detect a truly hung browser WITHOUT creating a new
+// context or page. `browser.newContext()/newPage()` can fail transiently on
+// this Firefox build ("delayedStartupPromise ... window is null"), and a single
+// such failure must never destroy every live tab. Probe an existing page, and
+// require consecutive failures before acting.
+const HEALTH_PROBE_FAILURE_THRESHOLD = 3;
 setInterval(async () => {
   if (!browser || healthState.isRecovering) return;
   const timeSinceSuccess = Date.now() - healthState.lastSuccessfulNav;
-  // Skip probe if operations are in flight AND last success was recent.
-  // If it's been >120s since any successful operation, probe anyway --
-  // active ops are likely stuck on a frozen browser and will time out eventually.
-  if (healthState.activeOps > 0 && timeSinceSuccess < 120000) {
+  if (timeSinceSuccess < 120000) return;
+  // Real work in flight owns the budget and its own timeout/recovery path.
+  if (healthState.activeOps > 0) {
     log('info', 'health probe skipped, operations active', { activeOps: healthState.activeOps });
     return;
   }
-  if (timeSinceSuccess < 120000) return;
-  
-  if (healthState.activeOps > 0) {
-    log('warn', 'health probe forced despite active ops', { activeOps: healthState.activeOps, timeSinceSuccessMs: timeSinceSuccess });
+
+  // A lost driver connection is the only immediate, unambiguous death signal.
+  if (browser.isConnected() === false) {
+    log('warn', 'health probe: browser connection lost', { timeSinceSuccessMs: timeSinceSuccess });
+    restartBrowser('health probe: disconnected').catch(() => {});
+    return;
   }
-  
-  let testContext;
-  try {
-    testContext = await browser.newContext({ viewport: null });
-    const page = await testContext.newPage();
-    await page.goto('about:blank', { timeout: 5000 });
-    await page.close();
-    await testContext.close();
+
+  // Ask an existing page whether the driver still answers. No new context/page.
+  let probePage = null;
+  for (const [, session] of sessions) {
+    try {
+      const pages = session.context.pages().filter((p) => p && !p.isClosed());
+      if (pages.length > 0) { probePage = pages[0]; break; }
+    } catch (_) {}
+  }
+  if (!probePage) {
+    // Idle browser with no tab to protect: nothing to probe, nothing to restart.
     healthState.lastSuccessfulNav = Date.now();
+    healthState.consecutiveProbeFailures = 0;
+    return;
+  }
+
+  try {
+    await Promise.race([
+      probePage.evaluate(() => 1),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('health probe evaluate timed out after 5000ms')), 5000)),
+    ]);
+    healthState.lastSuccessfulNav = Date.now();
+    healthState.consecutiveProbeFailures = 0;
   } catch (err) {
+    healthState.consecutiveProbeFailures += 1;
     failuresTotal.labels('health_probe', 'internal').inc();
-    log('warn', 'health probe failed', { error: err.message, timeSinceSuccessMs: timeSinceSuccess });
-    if (testContext) await testContext.close().catch(() => {});
-    restartBrowser('health probe failed').catch(() => {});
+    log('warn', 'health probe failed', {
+      error: err.message,
+      timeSinceSuccessMs: timeSinceSuccess,
+      consecutiveFailures: healthState.consecutiveProbeFailures,
+      threshold: HEALTH_PROBE_FAILURE_THRESHOLD,
+    });
+    if (healthState.consecutiveProbeFailures >= HEALTH_PROBE_FAILURE_THRESHOLD) {
+      restartBrowser('health probe failed').catch(() => {});
+    }
   }
 }, 60_000);
 
@@ -7791,6 +8576,9 @@ const pluginCtx = {
   VirtualDisplay,
 };
 const loadedPlugins = await loadPlugins(app, pluginCtx);
+
+// Static gesture demo page (served at /demo/).
+app.use('/demo', express.static(fileURLToPath(new URL('./demo', import.meta.url)), { index: 'index.html' }));
 
 // --- OpenAPI docs (after all routes are registered) ---
 mountDocs(app);

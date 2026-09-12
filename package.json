@@ -47,6 +47,7 @@
     "mcp/",
     "bin/",
     "scripts/",
+    "demo/",
     "run.sh",
     "Dockerfile",
     "README.md",
@@ -81,6 +82,18 @@
       {
         "name": "camofox_click",
         "description": "Click an element by ref, CSS selector, or screenshot coordinates"
+      },
+      {
+        "name": "camofox_hold",
+        "description": "Press and hold at a target with a humanized long press"
+      },
+      {
+        "name": "camofox_drag",
+        "description": "Drag and drop from a source to a target with a humanized native drag"
+      },
+      {
+        "name": "camofox_hover",
+        "description": "Move the mouse over a target with a humanized hover"
       },
       {
         "name": "camofox_type",

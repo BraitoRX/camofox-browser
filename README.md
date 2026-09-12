@@ -48,6 +48,8 @@ This project wraps that engine in a REST API built for agents: accessibility sna
 - **C++ Anti-Detection** - bypasses Google, Cloudflare, and most bot detection
 - **Element Refs** - stable `e1`, `e2`, `e3` identifiers for reliable interaction
 - **Screenshot Coordinate Navigation** - click by image pixels from a viewport screenshot; the capture's `captureId` maps pixels onto the live viewport, with element refs as the fallback
+- **Humanized Press-and-Hold** - trusted native mouse-down held for a configurable duration with a jittered approach and micro-movements, for "press and hold" challenges (e.g. PerimeterX captchas)
+- **Drag & Drop + Hover** - trusted native drag with a jittered multi-segment path and configurable dwell, plus humanized hover for menus/tooltips; ref/selector targets are scrolled into view first
 - **Token-Efficient** - accessibility snapshots are ~90% smaller than raw HTML
 - **Runs on Anything** - lazy browser launch + idle shutdown keeps memory at ~40MB when idle. Designed to share a box with the rest of your stack -- Raspberry Pi, $5 VPS, shared infra.
 - **Session Isolation** - separate cookies/storage per user
@@ -67,6 +69,7 @@ This project wraps that engine in a REST API built for agents: accessibility sna
 - **Structured Extract** - `POST /tabs/:tabId/extract` with a JSON Schema that maps properties to snapshot refs via `x-ref`
 - **Session Tracing** - opt-in per-session Playwright trace capture (screenshots + DOM snapshots + network) with API endpoints to list, fetch, and delete trace zips
 - **Telemetry** - automatic [anonymized crash/hang telemetry](lib/reporter.js#L28-L290) via GitHub Issues. Identifies which sites cause failures and common failure patterns. Private domains are HMAC-hashed, paths/params stripped, tokens/IPs redacted. Opt-out with `CAMOFOX_CRASH_REPORT_ENABLED=false`.
+- **Gesture Demo** - self-contained test page served at http://localhost:9377/demo/ covering click, right-click, double-click, hover, press-and-hold, drag & drop (mouse + HTML5), typing, select, and scroll
 
 ## Optional Dependencies
 
@@ -84,9 +87,9 @@ The Docker image includes yt-dlp. For local dev, install it for the `/youtube/tr
 openclaw plugins install @askjo/camofox-browser
 ```
 
-**Tools:** `camofox_create_tab`  |  `camofox_snapshot`  |  `camofox_click`  |  `camofox_type`  |  `camofox_navigate`  |  `camofox_scroll`  |  `camofox_screenshot`  |  `camofox_close_tab`  |  `camofox_evaluate`  |  `camofox_list_tabs`  |  `camofox_import_cookies`  |  `camofox_navigation_guard`
+**Tools:** `camofox_create_tab`  |  `camofox_snapshot`  |  `camofox_click`  |  `camofox_hold`  |  `camofox_drag`  |  `camofox_hover`  |  `camofox_type`  |  `camofox_navigate`  |  `camofox_scroll`  |  `camofox_screenshot`  |  `camofox_close_tab`  |  `camofox_evaluate`  |  `camofox_list_tabs`  |  `camofox_import_cookies`  |  `camofox_navigation_guard`
 
-*(`camofox_evaluate` was missing from this list. `camofox_navigation_guard` is a local addition — it appears only once the updated server and adapter source is loaded; editing source is not a deployment.)*
+*(`camofox_evaluate` was missing from this list. `camofox_navigation_guard`, `camofox_hold`, `camofox_drag`, and `camofox_hover` are local additions — they appear only once the updated server and adapter source is loaded; editing source is not a deployment.)*
 
 ### Standalone
 

@@ -60,7 +60,7 @@ Returns raw `image/png`. Viewport screenshots include an `X-Camofox-Visual-Metad
 # X-Camofox-Visual-Metadata header, then click an image pixel.
 POST /tabs/:tabId/click
 {"userId": "agent1", "coordinates": {"x": 412, "y": 268, "captureId": "<captureId>"}}
-# Optional: "doubleClick": true (coordinates only), or "includeScreenshot": true
+# Optional: "button": "right" | "middle", "doubleClick": true (both work with any target), or "includeScreenshot": true
 # to return the next viewport screenshot + fresh visualCapture (refsAvailable=false).
 
 # Fallback -- click by ref or CSS selector (no screenshot needed):
@@ -68,6 +68,29 @@ POST /tabs/:tabId/click
 {"userId": "agent1", "selector": "button.submit"}
 ```
 Coordinates are pixels in the screenshot PNG image (not CSS pixels) and cannot be combined with ref/selector.
+
+Optional: "button": "right" | "middle" and doubleClick now also work with ref/selector (both are refused while the links-only guard is active).
+
+### Press and Hold
+```bash
+POST /tabs/:tabId/hold
+{"userId": "agent1", "coordinates": {"x": 412, "y": 268, "captureId": "<captureId>"}, "durationMs": 12000, "humanize": true}
+```
+Dispatches one trusted native mouse-down held for `durationMs` (default 3000, max 20000), then releases. Optional `includeScreenshot: true` returns a post-hold screenshot + `visualCapture`. Blocked by the links-only guard. The challenge can clear asynchronously ~10-15s after release; wait before judging the result.
+
+### Drag and Drop
+```bash
+POST /tabs/:tabId/drag
+{"userId": "agent1", "source": {"ref": "e1"}, "target": {"selector": "#dropzone"}, "steps": 15, "holdBeforeDropMs": 200, "humanize": true, "includeScreenshot": true}
+```
+Source and target each take exactly one of `ref`, `selector`, or `coordinates` (both coordinate targets resolve against the same screenshot capture before any invalidation). Optional `steps` (1..60), `holdBeforeDropMs` (0..5000), `humanize` (default true), and `includeScreenshot` (post-drag screenshot + `visualCapture`). Ref/selector endpoints are scrolled into view first, and both endpoints must be inside the viewport when the drag starts; coordinate endpoints are viewport-relative and never scrolled. Blocked by the links-only guard.
+
+### Hover
+```bash
+POST /tabs/:tabId/hover
+{"userId": "agent1", "selector": "#menu", "settleMs": 500, "humanize": true, "includeScreenshot": true}
+```
+Moves the native pointer over the target center (`ref`, `selector`, or `coordinates`) with a humanized approach, then dwells for `settleMs` (0..5000; default 300) so hover menus/tooltips can open. Optional `includeScreenshot` (post-hover screenshot + `visualCapture`). Ref/selector targets are scrolled into view first. Blocked by the links-only guard.
 
 ### Type Text
 ```bash
@@ -185,6 +208,8 @@ docker run -p 9377:9377 camofox-browser
 - `lib/visual-capture.js` - Screenshot-coordinate capture/validation (viewport PNG + `visualCapture` metadata, 120s freshness, image-pixel -> CSS mapping)
 - `lib/navigation-guard.js` - Per-tab opt-in links-only navigation guard state (action/transition/popup ledgers, retry budget, popup inheritance)
 - `lib/native-input.js` - Browser-wide native mouse input serialization + input-stall probe with auto browser restart (`input_stall`)
+- `lib/gestures.js` - Humanized native press-and-hold gesture (jittered approach + micro-movements, always releases)
+- `demo/index.html` - Self-contained gesture test page (served at /demo/)
 - `lib/snapshot.js` - Accessibility tree snapshot
 - `lib/macros.js` - Search macro URL expansion
 - `lib/plugins.js` - Plugin loader and event bus
@@ -340,7 +365,7 @@ export function register(app, ctx) {
 | `sessions` | `Map` | Live sessions: `userId -> { context, tabGroups, lastAccess }` |
 | `config` | `object` | Server CONFIG (port, apiKey, nodeEnv, proxy, etc.) |
 | `log` | `function` | `log(level, msg, fields)` -- structured JSON logging |
-| `events` | `EventEmitter` | Plugin event bus (29 events -- see below) |
+| `events` | `EventEmitter` | Plugin event bus (32 events -- see below) |
 | `auth` | `function` | `auth()` returns Express middleware enforcing API key / loopback |
 | `ensureBrowser` | `async function` | Launch browser if not running, return browser instance |
 | `getSession` | `async function` | `getSession(userId)` -- get or create a session |
@@ -356,9 +381,9 @@ export function register(app, ctx) {
 | `createMetric` | `async function` | Create a Prometheus metric registered to the shared registry (see below) |
 | `metricsRegistry` | `function` | `metricsRegistry()` -- raw prom-client Registry or null |
 
-### Events (29)
+### Events (32)
 
-28 emitted by core, 1 (`session:storage:export`) emitted by plugins.
+31 emitted by core, 1 (`session:storage:export`) emitted by plugins.
 
 #### Browser Lifecycle
 | Event | Payload | Mutating? |
@@ -398,6 +423,9 @@ export function register(app, ctx) {
 | Event | Payload |
 |-------|---------|
 | `tab:click` | `{ userId, tabId, ref, selector, coordinates? }` (`coordinates` = mapped CSS x/y when a coordinate click was used) |
+| `tab:hold` | `{ userId, tabId, durationMs, humanize, coordinates? }` |
+| `tab:drag` | `{ userId, tabId, from?, to? }` |
+| `tab:hover` | `{ userId, tabId, settleMs, humanize, coordinates? }` |
 | `tab:type` | `{ userId, tabId, text, ref, mode }` |
 | `tab:scroll` | `{ userId, tabId, direction, amount }` |
 | `tab:press` | `{ userId, tabId, key }` |

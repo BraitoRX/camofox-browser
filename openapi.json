@@ -905,7 +905,16 @@
                   },
                   "doubleClick": {
                     "type": "boolean",
-                    "description": "Double-click (only used with coordinates)."
+                    "description": "Double-click (coordinates, ref, or selector). Refused while the links-only navigation guard is active."
+                  },
+                  "button": {
+                    "type": "string",
+                    "enum": [
+                      "left",
+                      "right",
+                      "middle"
+                    ],
+                    "description": "Mouse button (default left). Non-left buttons are refused while the links-only navigation guard is active."
                   },
                   "includeScreenshot": {
                     "type": "boolean",
@@ -990,6 +999,467 @@
           },
           "422": {
             "description": "Guard target is not a single visible native hyperlink (code guard_invalid_target).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tabs/{tabId}/hold": {
+      "post": {
+        "tags": [
+          "Interaction"
+        ],
+        "summary": "Press and hold a target (humanized long press)",
+        "description": "Dispatches one trusted native mouse press at a target (element ref, CSS selector, or image-pixel coordinates from the latest viewport screenshot), keeps it pressed for durationMs while optionally emitting small humanized micro-movements, then releases. Intended for \"press and hold\" human-verification widgets (e.g. PerimeterX captchas). Coordinates must carry the captureId from that screenshot's visualCapture metadata and cannot be combined with ref/selector. Blocked while the opt-in links-only navigation guard is active.\n",
+        "parameters": [
+          {
+            "name": "tabId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "userId"
+                ],
+                "properties": {
+                  "userId": {
+                    "type": "string"
+                  },
+                  "ref": {
+                    "type": "string",
+                    "description": "Element ref ID (e.g. \"e3\")."
+                  },
+                  "selector": {
+                    "type": "string",
+                    "description": "CSS selector fallback."
+                  },
+                  "coordinates": {
+                    "type": "object",
+                    "description": "Image-pixel coordinates in the latest standalone screenshot (its visualCapture.captureId). Mutually exclusive with ref/selector.",
+                    "required": [
+                      "x",
+                      "y",
+                      "captureId"
+                    ],
+                    "properties": {
+                      "x": {
+                        "type": "number"
+                      },
+                      "y": {
+                        "type": "number"
+                      },
+                      "captureId": {
+                        "type": "string"
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "durationMs": {
+                    "type": "integer",
+                    "description": "Hold duration in milliseconds (100..20000; default 3000)."
+                  },
+                  "humanize": {
+                    "type": "boolean",
+                    "description": "Humanized approach path plus micro-movements during the hold (default true)."
+                  },
+                  "includeScreenshot": {
+                    "type": "boolean",
+                    "description": "Return a post-hold viewport screenshot plus visualCapture metadata instead of rebuilding element refs (refsAvailable=false)."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Hold completed with optional post-hold screenshot and visualCapture metadata.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request (invalid_coordinates for malformed/out-of-range coordinates, or durationMs out of range).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Blocked by the active links-only navigation guard (code navigation_guard_violation).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tab not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Visual capture is stale or the page changed; retry with a fresh screenshot/snapshot.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Target element is not actionable (no bounding box / detached).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tabs/{tabId}/hover": {
+      "post": {
+        "tags": [
+          "Interaction"
+        ],
+        "summary": "Move the mouse over a target (humanized hover)",
+        "description": "Resolves a target (element ref, CSS selector, or image-pixel coordinates from the latest viewport screenshot) and moves the native pointer over its center with a humanized approach, then dwells for settleMs so hover menus/tooltips can open. Blocked while the opt-in links-only navigation guard is active.\n",
+        "parameters": [
+          {
+            "name": "tabId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "userId"
+                ],
+                "properties": {
+                  "userId": {
+                    "type": "string"
+                  },
+                  "ref": {
+                    "type": "string"
+                  },
+                  "selector": {
+                    "type": "string"
+                  },
+                  "coordinates": {
+                    "type": "object",
+                    "description": "Image-pixel coordinates in the latest standalone screenshot (its visualCapture.captureId). Mutually exclusive with ref/selector.",
+                    "required": [
+                      "x",
+                      "y",
+                      "captureId"
+                    ],
+                    "properties": {
+                      "x": {
+                        "type": "number"
+                      },
+                      "y": {
+                        "type": "number"
+                      },
+                      "captureId": {
+                        "type": "string"
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "settleMs": {
+                    "type": "integer",
+                    "description": "Dwell time after the move (0..5000; default 300)."
+                  },
+                  "humanize": {
+                    "type": "boolean",
+                    "description": "Humanized approach path (default true)."
+                  },
+                  "includeScreenshot": {
+                    "type": "boolean",
+                    "description": "Return a post-hover viewport screenshot plus visualCapture metadata."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Hover completed with optional post-hover screenshot.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request (invalid target, settleMs out of range, invalid_coordinates).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Blocked by the active links-only navigation guard (code navigation_guard_violation).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tab not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Visual capture is stale or the page changed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Target element is not actionable (no bounding box / detached).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tabs/{tabId}/drag": {
+      "post": {
+        "tags": [
+          "Interaction"
+        ],
+        "summary": "Drag and drop from a source to a target (humanized native drag)",
+        "description": "Resolves a source and a target (each an element ref, CSS selector, or image-pixel coordinates from the latest viewport screenshot), presses the primary button at the source center, moves along a humanized multi-segment path to the target center, optionally dwells there, then releases. Works for mouse-event drag implementations and HTML5 draggable elements (Firefox derives native drag from trusted mouse input). Ref/selector endpoints are scrolled into view first, and both endpoints must be inside the viewport when the drag starts (scroll so both are visible, or pass coordinates). Blocked while the opt-in links-only navigation guard is active.\n",
+        "parameters": [
+          {
+            "name": "tabId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "userId",
+                  "source",
+                  "target"
+                ],
+                "properties": {
+                  "userId": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "type": "object",
+                    "description": "Drag source; exactly one of ref, selector, or coordinates.",
+                    "properties": {
+                      "ref": {
+                        "type": "string"
+                      },
+                      "selector": {
+                        "type": "string"
+                      },
+                      "coordinates": {
+                        "type": "object",
+                        "required": [
+                          "x",
+                          "y",
+                          "captureId"
+                        ],
+                        "properties": {
+                          "x": {
+                            "type": "number"
+                          },
+                          "y": {
+                            "type": "number"
+                          },
+                          "captureId": {
+                            "type": "string"
+                          }
+                        },
+                        "additionalProperties": false
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "target": {
+                    "type": "object",
+                    "description": "Drop target; exactly one of ref, selector, or coordinates.",
+                    "properties": {
+                      "ref": {
+                        "type": "string"
+                      },
+                      "selector": {
+                        "type": "string"
+                      },
+                      "coordinates": {
+                        "type": "object",
+                        "required": [
+                          "x",
+                          "y",
+                          "captureId"
+                        ],
+                        "properties": {
+                          "x": {
+                            "type": "number"
+                          },
+                          "y": {
+                            "type": "number"
+                          },
+                          "captureId": {
+                            "type": "string"
+                          }
+                        },
+                        "additionalProperties": false
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "steps": {
+                    "type": "integer",
+                    "description": "Intermediate mousemove dispatches along the path (1..60; default humanized 10..20)."
+                  },
+                  "holdBeforeDropMs": {
+                    "type": "integer",
+                    "description": "Dwell over the target before releasing (0..5000; default humanized 80..250, 0 when humanize=false)."
+                  },
+                  "humanize": {
+                    "type": "boolean",
+                    "description": "Humanized approach and jittered path (default true)."
+                  },
+                  "includeScreenshot": {
+                    "type": "boolean",
+                    "description": "Return a post-drag viewport screenshot plus visualCapture metadata."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Drag completed with optional post-drag screenshot.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request (malformed source/target, out-of-range steps/holdBeforeDropMs, invalid_coordinates).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Blocked by the active links-only navigation guard (code navigation_guard_violation).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tab not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Visual capture is stale or the page changed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Source or target element is not actionable (no bounding box / detached).",
             "content": {
               "application/json": {
                 "schema": {
